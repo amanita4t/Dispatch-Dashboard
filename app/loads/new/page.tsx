@@ -1,15 +1,16 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useRef, useState, type FormEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { STATUSES, LOAD_TYPE_OPTIONS } from "@/lib/constants";
+import { sanitizeBoardReturnUrl, withBoardReturn } from "@/lib/board-navigation";
+import { requestJson } from "@/lib/client-api";
+import { errorMessage } from "@/lib/errors";
+import type { LoadRecord } from "@/lib/models";
+import { useActionLock } from "@/lib/use-action-lock";
+import { useDriverRoster } from "@/lib/use-driver-roster";
 import { IconArrowLeft, IconFile, IconUpload } from "@/components/icons";
-
-interface Driver {
-  id: number;
-  name: string;
-}
 
 const inputCls =
   "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20";
@@ -29,7 +30,7 @@ function FilePicker({
 
   return (
     <div>
-      <label className={labelCls}>
+      <label htmlFor={name} className={labelCls}>
         {label}{" "}
         {required ? (
           <span className="font-normal text-red-500">*</span>
@@ -38,6 +39,7 @@ function FilePicker({
         )}
       </label>
       <label
+        htmlFor={name}
         className={`flex cursor-pointer items-center gap-3 rounded-md border border-dashed px-3.5 py-3 transition-colors ${
           fileName
             ? "border-blue-300 bg-blue-50/50"
@@ -46,6 +48,7 @@ function FilePicker({
       >
         <input
           ref={ref}
+          id={name}
           type="file"
           name={name}
           required={required}
@@ -62,7 +65,7 @@ function FilePicker({
           <>
             <IconUpload className="h-4 w-4 shrink-0 text-slate-400" />
             <span className="flex-1 text-[13px] text-slate-500">
-              Choose a file<span className="hidden sm:inline"> or drop it here</span>…
+              Choose a file…
             </span>
             <span className="rounded border border-slate-300 bg-white px-2 py-1 text-[11.5px] font-medium text-slate-600 shadow-sm">
               Browse
@@ -75,44 +78,46 @@ function FilePicker({
 }
 
 export default function NewLoadPage() {
+  return (
+    <Suspense fallback={<div className="py-24 text-center text-[13px] text-slate-400">Loading booking form…</div>}>
+      <NewLoadForm />
+    </Suspense>
+  );
+}
+
+function NewLoadForm() {
   const router = useRouter();
-  const [drivers, setDrivers] = useState<Driver[]>([]);
+  const searchParams = useSearchParams();
+  const returnTo = sanitizeBoardReturnUrl(searchParams.get("returnTo"));
+  const { drivers, loading: driversLoading, error: driverError, refresh: refreshDrivers } = useDriverRoster();
   const [error, setError] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+  const { pending, begin, finish } = useActionLock();
+  const submitting = pending !== null;
+  const [pickupDate, setPickupDate] = useState("");
+  const [created, setCreated] = useState<{ load: LoadRecord; uploadErrors: string[] } | null>(null);
+  const hasCreatedLoad = useRef(false);
 
-  useEffect(() => {
-    fetch("/api/drivers")
-      .then((r) => r.json())
-      .then(setDrivers);
-  }, []);
-
-  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (hasCreatedLoad.current || driversLoading || driverError || drivers.length === 0 || !begin("booking")) return;
     setError("");
-    setSubmitting(true);
-    const form = new FormData(e.currentTarget);
     try {
-      const res = await fetch("/api/loads", { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Failed to create load");
-        setSubmitting(false);
-        return;
-      }
-      if (data.uploadErrors?.length) {
-        alert("Load created, but some files failed to upload:\n" + data.uploadErrors.join("\n"));
-      }
-      router.push(`/loads/${data.load.id}`);
-    } catch (err: any) {
-      setError(err.message);
-      setSubmitting(false);
+      const form = new FormData(e.currentTarget);
+      const data = await requestJson<{ load: LoadRecord; uploadErrors?: string[] }>("/api/loads", { method: "POST", body: form });
+      hasCreatedLoad.current = true;
+      setCreated({ load: data.load, uploadErrors: data.uploadErrors || [] });
+      if (!data.uploadErrors?.length) router.push(withBoardReturn(`/loads/${data.load.id}`, returnTo));
+    } catch (failure: unknown) {
+      setError(errorMessage(failure));
+    } finally {
+      finish();
     }
   }
 
   return (
     <div className="mx-auto max-w-[720px]">
       <Link
-        href="/"
+        href={returnTo}
         className="mb-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-slate-500 transition-colors hover:text-slate-800"
       >
         <IconArrowLeft className="h-3.5 w-3.5" />
@@ -126,7 +131,16 @@ export default function NewLoadPage() {
         </p>
       </div>
 
-      {drivers.length === 0 && (
+      {driversLoading && (
+        <p role="status" className="mb-5 rounded-md border border-slate-200 bg-white px-4 py-3 text-[13px] text-slate-500">Loading driver roster…</p>
+      )}
+      {driverError && (
+        <div role="alert" className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-800">
+          Unable to load the driver roster: {driverError}{" "}
+          <button onClick={() => void refreshDrivers()} disabled={submitting} className="font-semibold underline disabled:opacity-50">Retry drivers</button>
+        </div>
+      )}
+      {!driversLoading && !driverError && drivers.length === 0 && (
         <div className="mb-5 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-900">
           No drivers in the system yet.{" "}
           <Link href="/drivers" className="font-semibold underline underline-offset-2">
@@ -137,12 +151,27 @@ export default function NewLoadPage() {
       )}
 
       {error && (
-        <div className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-800">
+        <div role="alert" className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-800">
           {error}
         </div>
       )}
 
+      {created && (
+        <div role="status" className={`mb-5 rounded-md border px-4 py-3 text-[13px] ${created.uploadErrors.length ? "border-amber-200 bg-amber-50 text-amber-900" : "border-emerald-200 bg-emerald-50 text-emerald-900"}`}>
+          <p className="font-semibold">{created.load.load_type === "loadout" ? "Loadout" : "Load"} #{created.load.load_number} was created. Do not book it again.</p>
+          {created.uploadErrors.length > 0 && (
+            <>
+              <p className="mt-1">The required rate confirmation is saved, but these optional uploads failed:</p>
+              <ul className="mt-1 list-inside list-disc">{created.uploadErrors.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+              <p className="mt-2">Open the load to review its documents and upload only the failed files.</p>
+            </>
+          )}
+          <Link href={withBoardReturn(`/loads/${created.load.id}`, returnTo)} className="mt-2 inline-block font-semibold underline underline-offset-2">Open load and documents</Link>
+        </div>
+      )}
+
       <form onSubmit={onSubmit}>
+        <fieldset disabled={submitting || created !== null} className="min-w-0">
         {/* Section: booking */}
         <div className="overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm">
           <div className="border-b border-slate-200/80 bg-slate-50/60 px-5 py-3">
@@ -150,10 +179,10 @@ export default function NewLoadPage() {
           </div>
           <div className="grid grid-cols-1 gap-x-5 gap-y-4 p-5 sm:grid-cols-2">
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-type" className={labelCls}>
                 Load Type <span className="font-normal text-red-500">*</span>
               </label>
-              <select name="load_type" required defaultValue="load" className={inputCls}>
+              <select id="load-type" name="load_type" required defaultValue="load" className={inputCls}>
                 {LOAD_TYPE_OPTIONS.map((t) => (
                   <option key={t.value} value={t.value}>
                     {t.label}
@@ -162,18 +191,18 @@ export default function NewLoadPage() {
               </select>
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-number" className={labelCls}>
                 Load Number <span className="font-normal text-red-500">*</span>
               </label>
-              <input name="load_number" required placeholder="45812" className={`${inputCls} font-mono`} />
+              <input id="load-number" name="load_number" required placeholder="45812" className={`${inputCls} font-mono`} />
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-driver" className={labelCls}>
                 Driver <span className="font-normal text-red-500">*</span>
               </label>
-              <select name="driver_id" required className={inputCls} defaultValue="">
+              <select id="load-driver" name="driver_id" required disabled={driversLoading || Boolean(driverError)} className={inputCls} defaultValue="">
                 <option value="" disabled>
-                  Assign a driver…
+                  {driversLoading ? "Loading drivers…" : driverError ? "Driver roster unavailable" : "Assign a driver…"}
                 </option>
                 {drivers.map((d) => (
                   <option key={d.id} value={d.id}>
@@ -183,7 +212,7 @@ export default function NewLoadPage() {
               </select>
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-rate" className={labelCls}>
                 Rate (USD) <span className="font-normal text-red-500">*</span>
               </label>
               <div className="relative">
@@ -191,49 +220,55 @@ export default function NewLoadPage() {
                   $
                 </span>
                 <input
+                  id="load-rate"
                   name="rate_amount"
                   required
                   type="number"
                   step="0.01"
-                  min="0"
+                  min="0.01"
                   placeholder="2,500.00"
                   className={`${inputCls} tnum pl-7`}
                 />
               </div>
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-pickup-city" className={labelCls}>
                 Pickup City <span className="font-normal text-red-500">*</span>
               </label>
-              <input name="pickup_city" required placeholder="Dallas, TX" className={inputCls} />
+              <input id="load-pickup-city" name="pickup_city" required placeholder="Dallas, TX" className={inputCls} />
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-delivery-city" className={labelCls}>
                 Delivery City <span className="font-normal text-red-500">*</span>
               </label>
-              <input name="delivery_city" required placeholder="Atlanta, GA" className={inputCls} />
+              <input id="load-delivery-city" name="delivery_city" required placeholder="Atlanta, GA" className={inputCls} />
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-pickup-date" className={labelCls}>
                 Pickup Date <span className="font-normal text-red-500">*</span>
               </label>
-              <input name="pickup_date" required type="date" className={`${inputCls} tnum`} />
+              <input id="load-pickup-date" name="pickup_date" required type="date" value={pickupDate} onChange={(e) => setPickupDate(e.target.value)} className={`${inputCls} tnum`} />
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="load-delivery-date" className={labelCls}>
                 Delivery Date <span className="font-normal text-red-500">*</span>
               </label>
-              <input name="delivery_date" required type="date" className={`${inputCls} tnum`} />
+              <input id="load-delivery-date" name="delivery_date" required type="date" min={pickupDate || undefined} className={`${inputCls} tnum`} />
             </div>
-            <div className="sm:col-span-2">
-              <label className={labelCls}>Initial Status</label>
-              <select name="status" required defaultValue="scheduled" className={inputCls}>
+            <div>
+              <label htmlFor="load-status" className={labelCls}>Initial Status</label>
+              <select id="load-status" name="status" required defaultValue="scheduled" className={inputCls}>
                 {STATUSES.map((s) => (
                   <option key={s.value} value={s.value}>
                     {s.label}
                   </option>
                 ))}
               </select>
+            </div>
+            <div>
+              <label htmlFor="load-invoice-due-date" className={labelCls}>Invoice Due Date <span className="font-normal text-slate-400">· optional</span></label>
+              <input id="load-invoice-due-date" name="invoice_due_date" type="date" className={`${inputCls} tnum`} />
+              <p className="mt-1 text-[11.5px] text-slate-500">Use the agreed payment date. Leave blank if it is not yet known.</p>
             </div>
           </div>
         </div>
@@ -253,20 +288,21 @@ export default function NewLoadPage() {
             <FilePicker name="other_2" label="Other Document 2" />
           </div>
         </div>
+        </fieldset>
 
         <div className="mt-5 flex items-center justify-end gap-3">
           <Link
-            href="/"
+            href={returnTo}
             className="rounded-md px-4 py-2 text-[13px] font-medium text-slate-600 transition-colors hover:bg-slate-200/70"
           >
-            Cancel
+            {created ? "Back to Load Board" : "Cancel"}
           </Link>
           <button
             type="submit"
-            disabled={submitting || drivers.length === 0}
+            disabled={submitting || created !== null || driversLoading || Boolean(driverError) || drivers.length === 0}
             className="rounded-md bg-blue-600 px-5 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-blue-700 disabled:opacity-50"
           >
-            {submitting ? "Creating load & folder…" : "Book Load"}
+            {submitting ? "Creating load & folder…" : created ? "Load Created" : "Book Load"}
           </button>
         </div>
       </form>

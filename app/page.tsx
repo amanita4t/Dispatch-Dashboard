@@ -1,84 +1,113 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import { STATUSES, LOAD_TYPE_OPTIONS, fmtMoney, loadTypeLabel, initials } from "@/lib/constants";
+import { BOARD_FILTER_DEFAULTS, boardUrl, readBoardFilters, withBoardReturn, type BoardFilters } from "@/lib/board-navigation";
+import { requestJson } from "@/lib/client-api";
+import { overdueLabel } from "@/lib/dates";
+import { errorMessage } from "@/lib/errors";
+import type { LoadDetail, LoadStatus, LoadWithDriver, SyncSummary } from "@/lib/models";
+import { useActionLock } from "@/lib/use-action-lock";
+import { useDriverRoster } from "@/lib/use-driver-roster";
+import { useLocalToday } from "@/lib/use-local-today";
 import { IconPlus, IconSearch, IconSync, IconTruck, IconRoute, IconDollar, IconFile, IconChevronDown } from "@/components/icons";
 
-interface LoadRow {
-  id: number;
-  load_number: string;
-  load_type: string;
-  driver_name: string;
-  pickup_city: string;
-  delivery_city: string;
-  pickup_date: string;
-  delivery_date: string;
-  rate_amount: number;
-  status: string;
-}
+const filterCls = "rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20";
+const filterLabelCls = "mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500";
 
-interface Driver {
-  id: number;
-  name: string;
+function SortableHeading({
+  field, label, sort, order, onSort, right = false,
+}: {
+  field: string;
+  label: string;
+  sort: string;
+  order: string;
+  onSort: (field: string) => void;
+  right?: boolean;
+}) {
+  return (
+    <th scope="col" className={`px-4 py-2.5 ${right ? "text-right" : ""}`} aria-sort={sort === field ? (order === "asc" ? "ascending" : "descending") : "none"}>
+      <button onClick={() => onSort(field)} className="whitespace-nowrap text-left uppercase hover:text-blue-700 focus-visible:outline-blue-600">
+        {label}<span className="ml-1" aria-hidden="true">{sort === field ? (order === "asc" ? "↑" : "↓") : "↕"}</span>
+      </button>
+    </th>
+  );
 }
 
 export default function Dashboard() {
+  return (
+    <Suspense fallback={<div className="py-24 text-center text-[13px] text-slate-400">Loading load board…</div>}>
+      <LoadBoard />
+    </Suspense>
+  );
+}
+
+function LoadBoard() {
   const router = useRouter();
-  const [loads, setLoads] = useState<LoadRow[]>([]);
-  const [drivers, setDrivers] = useState<Driver[]>([]);
-  const [statusFilter, setStatusFilter] = useState("");
-  const [driverFilter, setDriverFilter] = useState("");
-  const [loadTypeFilter, setLoadTypeFilter] = useState("");
-  const [q, setQ] = useState("");
+  const searchParams = useSearchParams();
+  const navigationUrl = boardUrl(readBoardFilters(searchParams));
+  const [filters, setFilters] = useState(() => readBoardFilters(searchParams));
+  const { status: statusFilter, driver_id: driverFilter, load_type: loadTypeFilter, q } = filters;
+  const returnTo = boardUrl(filters);
+  const query = returnTo.slice(1);
+  const [loads, setLoads] = useState<LoadWithDriver[]>([]);
+  const { drivers, loading: driversLoading, error: driverError, refresh: refreshDrivers } = useDriverRoster();
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [driverError, setDriverError] = useState("");
+  const [actionError, setActionError] = useState("");
   const [refreshVersion, setRefreshVersion] = useState(0);
-  const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
+  const { pending, begin, finish } = useActionLock();
+  const syncing = pending === "sync";
+  const today = useLocalToday();
+  const searchHistoryStarted = useRef(false);
 
   const refresh = useCallback(() => setRefreshVersion((version) => version + 1), []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    fetch("/api/drivers", { signal: controller.signal })
-      .then((res) => {
-        if (!res.ok) throw new Error("Failed to load the driver filter.");
-        return res.json();
-      })
-      .then((data: Driver[]) => {
-        if (!controller.signal.aborted) setDrivers(data);
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          setDriverError(error instanceof Error ? error.message : "Failed to load the driver filter.");
-        }
-      });
-    return () => controller.abort();
+    const current = readBoardFilters(new URLSearchParams(window.location.search));
+    // Ignore an older router transition after a newer filter edit updated native history.
+    if (boardUrl(current) === navigationUrl) setFilters(current);
+  }, [navigationUrl]);
+
+  useEffect(() => {
+    const resetSearchHistory = () => {
+      searchHistoryStarted.current = false;
+      setFilters(readBoardFilters(new URLSearchParams(window.location.search)));
+    };
+    window.addEventListener("popstate", resetSearchHistory);
+    return () => window.removeEventListener("popstate", resetSearchHistory);
   }, []);
+
+  function changeFilters(changes: Partial<BoardFilters>, replace = false) {
+    const current = readBoardFilters(new URLSearchParams(window.location.search));
+    const next = { ...current, ...changes };
+    const url = boardUrl(next);
+    setFilters(next);
+    if (url !== window.location.pathname + window.location.search) {
+      if (replace) window.history.replaceState(null, "", url);
+      else window.history.pushState(null, "", url);
+    }
+    if (!("q" in changes)) searchHistoryStarted.current = false;
+  }
+
+  function sortBy(field: string) {
+    changeFilters({ sort: field, order: filters.sort === field && filters.order === "asc" ? "desc" : "asc" });
+  }
 
   useEffect(() => {
     const controller = new AbortController();
+    setLoading(true);
+    setLoadError("");
     async function fetchLoads() {
-      const params = new URLSearchParams();
-      if (statusFilter) params.set("status", statusFilter);
-      if (driverFilter) params.set("driver_id", driverFilter);
-      if (loadTypeFilter) params.set("load_type", loadTypeFilter);
-      if (q) params.set("q", q);
-      setLoading(true);
-      setLoadError("");
       try {
-        const res = await fetch(`/api/loads?${params}`, { signal: controller.signal });
-        if (!res.ok) throw new Error("Failed to load loads.");
-        const data: LoadRow[] = await res.json();
+        const data = await requestJson<LoadWithDriver[]>(`/api/loads${query}`, { signal: controller.signal });
         if (!controller.signal.aborted) setLoads(data);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setLoadError(error instanceof Error ? error.message : "Failed to load loads.");
-        }
+      } catch (failure: unknown) {
+        if (!controller.signal.aborted) setLoadError(errorMessage(failure));
       } finally {
         if (!controller.signal.aborted) setLoading(false);
       }
@@ -88,43 +117,56 @@ export default function Dashboard() {
       clearTimeout(t);
       controller.abort();
     };
-  }, [statusFilter, driverFilter, loadTypeFilter, q, refreshVersion]);
+  }, [query, q, refreshVersion]);
 
-  async function updateStatus(id: number, status: string) {
-    await fetch(`/api/loads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    refresh();
+  async function updateStatus(load: LoadWithDriver, status: LoadStatus) {
+    if (load.archived_at || load.status === status || !begin(`status:${load.id}`)) return;
+    setActionError("");
+    try {
+      await requestJson<LoadDetail>(`/api/loads/${load.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      refresh();
+    } catch (failure: unknown) {
+      setActionError(`Could not update ${loadTypeLabel(load.load_type)} #${load.load_number}: ${errorMessage(failure)}`);
+    } finally {
+      finish();
+    }
   }
 
   async function syncFromStorage() {
-    setSyncing(true);
+    if (!begin("sync")) return;
     setSyncMsg("");
+    setActionError("");
     try {
-      const res = await fetch("/api/sync", { method: "POST" });
-      const s = await res.json();
-      if (!res.ok) throw new Error(s.error || "Sync failed");
-      let msg = `Sync complete: ${s.loadsImported} load(s) imported, ${s.filesImported} file(s) imported.`;
-      if (s.errors?.length) msg += ` ${s.errors.length} error(s): ${s.errors.join("; ")}`;
+      const s = await requestJson<SyncSummary>("/api/sync", { method: "POST" });
+      let msg = `Sync complete: ${s.driversImported} driver(s), ${s.loadsImported} load(s), ${s.filesImported} file(s) imported.`;
+      if (s.loadsArchived) msg += ` ${s.loadsArchived} load(s) moved to Archived because their folders are missing. Deleted documents were not recovered.`;
+      if (s.skippedArchived) msg += ` ${s.skippedArchived} archived folder(s) skipped.`;
+      if (s.errors.length) msg += ` ${s.errors.length} error(s): ${s.errors.join("; ")}`;
       setSyncMsg(msg);
       refresh();
-    } catch (e: any) {
-      setSyncMsg(`Sync failed: ${e.message}`);
+      await refreshDrivers();
+    } catch (failure: unknown) {
+      setActionError(`Sync failed: ${errorMessage(failure)}`);
+    } finally {
+      finish();
     }
-    setSyncing(false);
   }
 
+  const resultsReady = !loading && !loadError;
+  const visibleLoads = resultsReady ? loads : [];
   const totals = STATUSES.map((s) => ({
     ...s,
-    count: loads.filter((l) => l.status === s.value).length,
+    count: visibleLoads.filter((l) => l.status === s.value).length,
   }));
 
-  const activeCount = loads.filter((l) => l.status !== "paid").length;
-  const inTransit = loads.filter((l) => l.status === "picked_up").length;
-  const awaitingPay = loads.filter((l) => l.status === "invoiced").length;
-  const totalBooked = loads.reduce((sum, l) => sum + (l.rate_amount || 0), 0);
+  const activeCount = visibleLoads.filter((l) => !l.archived_at && l.status !== "paid").length;
+  const inTransit = visibleLoads.filter((l) => !l.archived_at && l.status === "picked_up").length;
+  const awaitingPay = visibleLoads.filter((l) => !l.archived_at && l.status === "invoiced").length;
+  const totalBooked = visibleLoads.reduce((sum, l) => sum + l.rate_amount, 0);
 
   const kpis = [
     { label: "Active Loads", value: String(activeCount), icon: IconTruck, tint: "bg-blue-50 text-blue-600" },
@@ -136,7 +178,7 @@ export default function Dashboard() {
   return (
     <div>
       {/* Page header */}
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-[22px] font-semibold tracking-tight text-slate-900">Load Board</h1>
           <p className="mt-0.5 text-[13px] text-slate-500">
@@ -146,15 +188,15 @@ export default function Dashboard() {
         <div className="flex items-center gap-2.5">
           <button
             onClick={syncFromStorage}
-            disabled={syncing}
-            title="Import load folders created manually in storage under registered drivers"
+            disabled={pending !== null}
+            title="Import new drivers, loads, and documents, and archive loads whose folders were deleted"
             className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3.5 py-2 text-[13px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-50"
           >
             <IconSync className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
             {syncing ? "Syncing…" : "Sync Storage"}
           </button>
           <Link
-            href="/loads/new"
+            href={withBoardReturn("/loads/new", returnTo)}
             className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-blue-700"
           >
             <IconPlus className="h-3.5 w-3.5" />
@@ -164,12 +206,13 @@ export default function Dashboard() {
       </div>
 
       {syncMsg && (
-        <div className="mb-5 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-[13px] text-blue-900">
+        <div role="status" className="mb-5 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-[13px] text-blue-900">
           {syncMsg}
         </div>
       )}
 
       {/* KPI strip */}
+      <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Filtered totals</h2>
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
         {kpis.map((k) => {
           const Icon = k.icon;
@@ -180,7 +223,7 @@ export default function Dashboard() {
               </div>
               <div className="min-w-0">
                 <div className="truncate text-[11px] font-medium uppercase tracking-wide text-slate-500">{k.label}</div>
-                <div className="tnum text-lg font-semibold leading-tight text-slate-900">{k.value}</div>
+                <div className="tnum text-lg font-semibold leading-tight text-slate-900">{resultsReady ? k.value : "—"}</div>
               </div>
             </div>
           );
@@ -188,6 +231,30 @@ export default function Dashboard() {
       </div>
 
       {/* Filters */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <span className="mr-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">View</span>
+        {[
+          { value: "active", label: "Active" },
+          { value: "archived", label: "Archived" },
+          { value: "all", label: "All loads" },
+        ].map((view) => (
+          <button
+            key={view.value}
+            aria-pressed={filters.archived === view.value}
+            onClick={() => changeFilters({ archived: view.value })}
+            className={`rounded-md border px-3 py-1.5 text-[12.5px] font-medium transition-colors ${filters.archived === view.value ? "border-blue-200 bg-blue-50 text-blue-800" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"}`}
+          >
+            {view.label}
+          </button>
+        ))}
+        <button
+          onClick={() => changeFilters(BOARD_FILTER_DEFAULTS)}
+          disabled={returnTo === "/"}
+          className="ml-auto rounded-md px-3 py-1.5 text-[12.5px] font-medium text-slate-600 hover:bg-slate-200/70 disabled:opacity-40"
+        >
+          Clear filters
+        </button>
+      </div>
       <div className="mb-3 flex flex-wrap items-end gap-3">
         <div>
           <label htmlFor="driver-filter" className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
@@ -196,10 +263,14 @@ export default function Dashboard() {
           <select
             id="driver-filter"
             value={driverFilter}
-            onChange={(e) => setDriverFilter(e.target.value)}
+            onChange={(e) => changeFilters({ driver_id: e.target.value })}
+            disabled={driversLoading || Boolean(driverError)}
             className="w-48 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
           >
             <option value="">All drivers</option>
+            {driverFilter && !drivers.some((driver) => String(driver.id) === driverFilter) && (
+              <option value={driverFilter}>Driver #{driverFilter}{driversLoading ? " (loading…)" : ""}</option>
+            )}
             {drivers.map((driver) => (
               <option key={driver.id} value={driver.id}>
                 {driver.name}
@@ -214,7 +285,7 @@ export default function Dashboard() {
           <select
             id="load-type-filter"
             value={loadTypeFilter}
-            onChange={(e) => setLoadTypeFilter(e.target.value)}
+            onChange={(e) => changeFilters({ load_type: e.target.value })}
             className="w-44 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
           >
             <option value="">All load types</option>
@@ -229,33 +300,89 @@ export default function Dashboard() {
           <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
           <input
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => {
+              changeFilters({ q: e.target.value }, searchHistoryStarted.current);
+              searchHistoryStarted.current = true;
+            }}
+            onBlur={() => { searchHistoryStarted.current = false; }}
             placeholder="Search load #, city, driver…"
             aria-label="Search loads"
             className="w-72 rounded-md border border-slate-300 bg-white py-1.5 pl-9 pr-3 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
           />
         </div>
       </div>
-      {(driverError || loadError) && (
+      <div className="mb-4 flex flex-wrap items-end gap-3">
+        <div>
+          <label htmlFor="date-field-filter" className={filterLabelCls}>Date field</label>
+          <select id="date-field-filter" value={filters.date_field} onChange={(e) => changeFilters({ date_field: e.target.value })} className={filterCls}>
+            <option value="pickup_date">Pickup date</option>
+            <option value="delivery_date">Delivery date</option>
+            <option value="invoice_due_date">Invoice due date</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="date-from-filter" className={filterLabelCls}>From (inclusive)</label>
+          <input id="date-from-filter" type="date" value={filters.date_from} onChange={(e) => changeFilters({ date_from: e.target.value })} className={`${filterCls} tnum`} />
+        </div>
+        <div>
+          <label htmlFor="date-to-filter" className={filterLabelCls}>To (inclusive)</label>
+          <input id="date-to-filter" type="date" value={filters.date_to} min={filters.date_from || undefined} onChange={(e) => changeFilters({ date_to: e.target.value })} className={`${filterCls} tnum`} />
+        </div>
+        <div className="sm:ml-auto">
+          <label htmlFor="sort-filter" className={filterLabelCls}>Sort by</label>
+          <select id="sort-filter" value={filters.sort} onChange={(e) => changeFilters({ sort: e.target.value })} className={filterCls}>
+            <option value="created_at">Created date</option>
+            <option value="load_number">Load number</option>
+            <option value="driver_name">Driver</option>
+            <option value="pickup_date">Pickup date</option>
+            <option value="delivery_date">Delivery date</option>
+            <option value="invoice_due_date">Invoice due date</option>
+            <option value="rate_amount">Rate</option>
+            <option value="status">Status</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="order-filter" className={filterLabelCls}>Order</label>
+          <select id="order-filter" value={filters.order} onChange={(e) => changeFilters({ order: e.target.value })} className={filterCls}>
+            <option value="desc">Descending</option>
+            <option value="asc">Ascending</option>
+          </select>
+        </div>
+      </div>
+      {driverError && (
         <div role="alert" className="mb-3 rounded-md border border-red-200 bg-red-50 px-4 py-2.5 text-[13px] text-red-800">
-          {[driverError, loadError].filter(Boolean).join(" ")}
+          Driver filter unavailable: {driverError}{" "}
+          <button onClick={() => void refreshDrivers()} className="font-semibold underline">Retry drivers</button>
+        </div>
+      )}
+      {loadError && (
+        <div role="alert" className="mb-3 rounded-md border border-red-200 bg-red-50 px-4 py-2.5 text-[13px] text-red-800">
+          {loadError}{" "}
+          <button onClick={refresh} className="font-semibold underline">Retry loads</button>
+        </div>
+      )}
+      {actionError && (
+        <div role="alert" className="mb-3 rounded-md border border-red-200 bg-red-50 px-4 py-2.5 text-[13px] text-red-800">
+          {actionError}
         </div>
       )}
       <div className="mb-3 flex flex-wrap items-center gap-1.5">
         <button
-          onClick={() => setStatusFilter("")}
+          onClick={() => changeFilters({ status: "" })}
+          aria-pressed={statusFilter === ""}
           className={`rounded-md px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
             statusFilter === ""
               ? "bg-slate-900 text-white"
               : "text-slate-600 hover:bg-slate-200/70"
           }`}
         >
-          All{statusFilter === "" ? ` · ${loads.length}` : ""}
+          All statuses{statusFilter === "" && resultsReady ? ` · ${loads.length}` : ""}
         </button>
         {totals.map((s) => (
           <button
             key={s.value}
-            onClick={() => setStatusFilter(statusFilter === s.value ? "" : s.value)}
+            onClick={() => changeFilters({ status: statusFilter === s.value ? "" : s.value })}
+            aria-pressed={statusFilter === s.value}
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
               statusFilter === s.value
                 ? "bg-slate-900 text-white"
@@ -264,66 +391,74 @@ export default function Dashboard() {
           >
             <span className={`h-1.5 w-1.5 rounded-full ${s.dot}`} />
             {s.label}
-            {statusFilter === "" && <span className="tnum text-slate-400">{s.count}</span>}
+            {statusFilter === "" && resultsReady && <span className="tnum text-slate-400">{s.count}</span>}
           </button>
         ))}
       </div>
 
       {/* Table */}
-      <div className="overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm">
+      {pending?.startsWith("status:") && <p role="status" className="mb-2 text-[12px] text-slate-500">Updating status…</p>}
+      <div className="overflow-x-auto rounded-lg border border-slate-200/80 bg-white shadow-sm">
         <table className="w-full text-left text-[13px]">
           <thead>
             <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-              <th className="px-4 py-2.5">Load</th>
-              <th className="px-4 py-2.5">Driver</th>
-              <th className="px-4 py-2.5">Route</th>
-              <th className="px-4 py-2.5">Pickup</th>
-              <th className="px-4 py-2.5">Delivery</th>
-              <th className="px-4 py-2.5 text-right">Rate</th>
-              <th className="px-4 py-2.5">Status</th>
-              <th className="w-10 px-4 py-2.5"></th>
+              <SortableHeading field="load_number" label="Load" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <SortableHeading field="driver_name" label="Driver" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <th scope="col" className="px-4 py-2.5">Route</th>
+              <SortableHeading field="pickup_date" label="Pickup" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <SortableHeading field="delivery_date" label="Delivery" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <SortableHeading field="invoice_due_date" label="Invoice due" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <SortableHeading field="rate_amount" label="Rate" sort={filters.sort} order={filters.order} onSort={sortBy} right />
+              <SortableHeading field="status" label="Status" sort={filters.sort} order={filters.order} onSort={sortBy} />
+              <th scope="col" className="w-10 px-4 py-2.5"><span className="sr-only">Update status</span></th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={8} className="px-4 py-16 text-center text-[13px] text-slate-400">
+                <td colSpan={9} className="px-4 py-16 text-center text-[13px] text-slate-400">
                   Loading loads…
                 </td>
               </tr>
             ) : loadError ? (
               <tr>
-                <td colSpan={8} className="px-4 py-16 text-center text-[13px] text-red-600">
+                <td colSpan={9} className="px-4 py-16 text-center text-[13px] text-red-600">
                   Unable to display loads. Please try again.
                 </td>
               </tr>
             ) : loads.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-4 py-16 text-center">
+                <td colSpan={9} className="px-4 py-16 text-center">
                   <IconTruck className="mx-auto mb-3 h-8 w-8 text-slate-300" />
                   <div className="text-[14px] font-medium text-slate-600">No loads found</div>
                   <div className="mt-1 text-[13px] text-slate-400">
-                    {driverFilter || loadTypeFilter || statusFilter || q
+                    {returnTo !== "/"
                       ? "Try changing your filters or search."
                       : "Book a load or sync existing folders from storage."}
                   </div>
                 </td>
               </tr>
             ) : (
-              loads.map((l) => (
+              loads.map((l) => {
+                const overdue = today ? overdueLabel(l, today) : "";
+                const href = withBoardReturn(`/loads/${l.id}`, returnTo);
+                return (
                 <tr
                   key={l.id}
-                  onClick={() => router.push(`/loads/${l.id}`)}
+                  onClick={() => router.push(href)}
                   className="group cursor-pointer border-b border-slate-100 transition-colors last:border-0 hover:bg-slate-50/70"
                 >
                   <td className="px-4 py-3">
-                    <span className="font-mono text-[13px] font-semibold text-slate-900">
+                    <Link href={href} onClick={(e) => e.stopPropagation()} className="font-mono text-[13px] font-semibold text-slate-900 hover:text-blue-700 hover:underline">
                       {l.load_number}
-                    </span>
+                    </Link>
                     {l.load_type === "loadout" && (
                       <span className="ml-2 rounded bg-orange-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-orange-700 ring-1 ring-inset ring-orange-200">
                         Loadout
                       </span>
+                    )}
+                    {l.archived_at && (
+                      <span className="mt-1 block w-fit rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-600 ring-1 ring-inset ring-slate-200">Archived</span>
                     )}
                   </td>
                   <td className="px-4 py-3">
@@ -349,19 +484,26 @@ export default function Dashboard() {
                   </td>
                   <td className="tnum px-4 py-3 text-slate-600">{l.pickup_date || <span className="text-slate-400">—</span>}</td>
                   <td className="tnum px-4 py-3 text-slate-600">{l.delivery_date || <span className="text-slate-400">—</span>}</td>
+                  <td className="tnum px-4 py-3 text-slate-600">{l.invoice_due_date || <span className="text-slate-400">—</span>}</td>
                   <td className="tnum px-4 py-3 text-right font-semibold text-slate-900">
                     {l.rate_amount ? fmtMoney(l.rate_amount) : <span className="font-normal text-slate-400">—</span>}
                   </td>
                   <td className="px-4 py-3">
                     <StatusBadge status={l.status} />
+                    {overdue && <span className="mt-1 block whitespace-nowrap text-[11px] font-semibold text-red-700">{overdue}</span>}
                   </td>
                   <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                    <div className="relative opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+                    {l.archived_at ? (
+                      <span className="whitespace-nowrap text-[11px] text-slate-400">Read only</span>
+                    ) : (
+                    <div className="relative transition-opacity focus-within:opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
                       <select
                         value={l.status}
-                        onChange={(e) => updateStatus(l.id, e.target.value)}
+                        onChange={(e) => updateStatus(l, e.target.value as LoadStatus)}
+                        disabled={pending !== null}
                         title="Update status"
-                        className="w-7 cursor-pointer appearance-none rounded-md border border-slate-300 bg-white py-1 pl-2 text-transparent shadow-sm hover:bg-slate-50 focus:outline-none"
+                        aria-label={`Update status for ${loadTypeLabel(l.load_type)} #${l.load_number}`}
+                        className="w-7 cursor-pointer appearance-none rounded-md border border-slate-300 bg-white py-1 pl-2 text-transparent shadow-sm hover:bg-slate-50 focus:outline-none disabled:cursor-wait disabled:opacity-50"
                       >
                         {STATUSES.map((s) => (
                           <option key={s.value} value={s.value} className="text-slate-900">
@@ -371,9 +513,11 @@ export default function Dashboard() {
                       </select>
                       <IconChevronDown className="pointer-events-none absolute left-1.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
                     </div>
+                    )}
                   </td>
                 </tr>
-              ))
+                );
+              })
             )}
           </tbody>
         </table>

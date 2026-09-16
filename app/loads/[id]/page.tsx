@@ -1,35 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useParams, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { STATUSES, CATEGORIES, categoryLabel, fmtMoney, initials } from "@/lib/constants";
+import { sanitizeBoardReturnUrl } from "@/lib/board-navigation";
+import { requestJson } from "@/lib/client-api";
+import { uploadSelectedFiles } from "@/lib/client-uploads";
+import { overdueLabel } from "@/lib/dates";
+import { errorMessage } from "@/lib/errors";
+import type { FileCategory, FileRecord, LoadDetail, LoadStatus } from "@/lib/models";
+import { useActionLock } from "@/lib/use-action-lock";
+import { useDriverRoster } from "@/lib/use-driver-roster";
+import { useLocalToday } from "@/lib/use-local-today";
 import { IconArrowLeft, IconFile, IconFolder, IconTrash, IconUpload } from "@/components/icons";
-
-interface FileRec {
-  id: number;
-  category: string;
-  filename: string;
-  web_link: string;
-  size: number;
-  uploaded_at: string;
-}
-
-interface LoadDetail {
-  id: number;
-  load_number: string;
-  load_type: string;
-  driver_name: string;
-  pickup_city: string;
-  delivery_city: string;
-  pickup_date: string;
-  delivery_date: string;
-  rate_amount: number;
-  status: string;
-  notes: string;
-  folder_ref: string;
-  files: FileRec[];
-}
 
 function fmtSize(n: number) {
   if (n > 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
@@ -38,144 +22,258 @@ function fmtSize(n: number) {
 }
 
 export default function LoadDetailPage() {
+  return (
+    <Suspense fallback={<div className="py-24 text-center text-[13px] text-slate-400">Loading load…</div>}>
+      <LoadDetailRoute />
+    </Suspense>
+  );
+}
+
+function LoadDetailRoute() {
   const { id } = useParams<{ id: string }>();
-  const router = useRouter();
+  const searchParams = useSearchParams();
+  return <LoadDetailView key={id} id={id} returnTo={sanitizeBoardReturnUrl(searchParams.get("returnTo"))} />;
+}
+
+function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
+  const loadUrl = `/api/loads/${encodeURIComponent(id)}`;
   const [load, setLoad] = useState<LoadDetail | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [category, setCategory] = useState("bol");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [uploadError, setUploadError] = useState("");
+  const [notesError, setNotesError] = useState("");
+  const [editError, setEditError] = useState("");
+  const [category, setCategory] = useState<FileCategory>("bol");
   const [files, setFiles] = useState<File[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
   const [notes, setNotes] = useState("");
+  const notesDraft = useRef("");
+  const notesDirty = useRef(false);
   const [notesSaved, setNotesSaved] = useState(false);
-  const [error, setError] = useState("");
   const [editing, setEditing] = useState(false);
+  const { drivers, loading: driversLoading, error: driverError, refresh: refreshDrivers } = useDriverRoster();
+  const { pending, begin, finish } = useActionLock();
+  const busy = pending !== null;
+  const archived = Boolean(load?.archived_at);
+  const today = useLocalToday();
+  const request = useRef<AbortController | null>(null);
   const [edit, setEdit] = useState({
+    driver_id: "",
     pickup_city: "",
     delivery_city: "",
     pickup_date: "",
     delivery_date: "",
+    invoice_due_date: "",
     rate_amount: "",
   });
-  const [savingEdit, setSavingEdit] = useState(false);
+
+  const acceptLoad = useCallback((data: LoadDetail) => {
+    setLoad(data);
+    if (!notesDirty.current) {
+      if (notesDraft.current !== data.notes) setNotesSaved(false);
+      setNotes(data.notes);
+      notesDraft.current = data.notes;
+    } else {
+      notesDirty.current = notesDraft.current !== data.notes;
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
-    const res = await fetch(`/api/loads/${id}`);
-    if (!res.ok) return;
-    const data = await res.json();
-    setLoad(data);
-    setNotes(data.notes || "");
-  }, [id]);
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setLoadError("");
+    try {
+      const data = await requestJson<LoadDetail>(loadUrl, { signal: controller.signal });
+      if (!controller.signal.aborted) acceptLoad(data);
+    } catch (failure: unknown) {
+      if (!controller.signal.aborted) setLoadError(errorMessage(failure));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }, [loadUrl, acceptLoad]);
 
   useEffect(() => {
-    refresh();
+    void refresh();
+    return () => request.current?.abort();
   }, [refresh]);
 
-  async function updateStatus(status: string) {
-    await fetch(`/api/loads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    refresh();
+  async function updateStatus(status: LoadStatus) {
+    if (!load || archived || status === load.status || !begin("status")) return;
+    setActionError("");
+    try {
+      acceptLoad(await requestJson<LoadDetail>(loadUrl, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      }));
+    } catch (failure: unknown) {
+      setActionError(`Status update failed: ${errorMessage(failure)}`);
+    } finally {
+      finish();
+    }
   }
 
   function startEdit() {
-    if (!load) return;
+    if (!load || archived || busy) return;
     setEdit({
+      driver_id: String(load.driver_id),
       pickup_city: load.pickup_city || "",
       delivery_city: load.delivery_city || "",
       pickup_date: load.pickup_date || "",
       delivery_date: load.delivery_date || "",
-      rate_amount: load.rate_amount ? String(load.rate_amount) : "",
+      invoice_due_date: load.invoice_due_date || "",
+      rate_amount: String(load.rate_amount),
     });
+    setEditError("");
     setEditing(true);
   }
 
-  async function saveEdit() {
-    setSavingEdit(true);
-    setError("");
-    const res = await fetch(`/api/loads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        pickup_city: edit.pickup_city,
-        delivery_city: edit.delivery_city,
-        pickup_date: edit.pickup_date,
-        delivery_date: edit.delivery_date,
-        rate_amount: edit.rate_amount === "" ? 0 : Number(edit.rate_amount),
-      }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      setError(data.error || "Failed to save changes");
-    } else {
-      setEditing(false);
+  async function saveEdit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!load || archived || busy) return;
+    const rate = edit.rate_amount === "" ? 0 : Number(edit.rate_amount);
+    if (!Number.isFinite(rate) || rate < 0) {
+      setEditError("Enter a valid rate of zero or more.");
+      return;
     }
-    setSavingEdit(false);
-    refresh();
+    if (edit.pickup_date && edit.delivery_date && edit.delivery_date < edit.pickup_date) {
+      setEditError("Delivery date cannot be before pickup date.");
+      return;
+    }
+    if (!begin("edit")) return;
+    setEditError("");
+    try {
+      acceptLoad(await requestJson<LoadDetail>(loadUrl, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          driver_id: Number(edit.driver_id),
+          pickup_city: edit.pickup_city,
+          delivery_city: edit.delivery_city,
+          pickup_date: edit.pickup_date,
+          delivery_date: edit.delivery_date,
+          invoice_due_date: edit.invoice_due_date,
+          rate_amount: rate,
+        }),
+      }));
+      setEditing(false);
+    } catch (failure: unknown) {
+      setEditError(errorMessage(failure));
+    } finally {
+      finish();
+    }
   }
 
   async function saveNotes() {
-    await fetch(`/api/loads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ notes }),
-    });
-    setNotesSaved(true);
-    setTimeout(() => setNotesSaved(false), 2000);
-    refresh();
+    if (!load || archived || notes === load.notes || !begin("notes")) return;
+    setNotesError("");
+    setNotesSaved(false);
+    try {
+      const data = await requestJson<LoadDetail>(loadUrl, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes }),
+      });
+      notesDirty.current = false;
+      acceptLoad(data);
+      setNotesSaved(true);
+    } catch (failure: unknown) {
+      setNotesError(errorMessage(failure));
+    } finally {
+      finish();
+    }
   }
 
-  async function uploadFiles(e: React.FormEvent) {
+  async function uploadFiles(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (files.length === 0) return;
-    setUploading(true);
-    setError("");
-    const failed: string[] = [];
-    for (const f of files) {
-      const fd = new FormData();
-      fd.set("file", f);
-      fd.set("category", category);
-      const res = await fetch(`/api/loads/${id}/files`, { method: "POST", body: fd });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        failed.push(`${f.name}: ${data.error || "upload failed"}`);
+    if (files.length === 0 || archived || !begin("upload")) return;
+    setUploadError("");
+    try {
+      const result = await uploadSelectedFiles(id, category, files);
+      setLoad((current) => current ? { ...current, files: [...current.files, ...result.uploaded] } : current);
+      setFiles(result.failedFiles);
+      if (fileInput.current) fileInput.current.value = "";
+      if (result.errors.length) {
+        setUploadError(`${result.errors.join("; ")}. Only failed files remain selected; retry to upload those files.`);
       }
+    } catch (failure: unknown) {
+      setUploadError(errorMessage(failure));
+    } finally {
+      finish();
     }
-    if (failed.length) {
-      setError(failed.join("; "));
-    } else {
-      setFiles([]);
-      (document.getElementById("file-input") as HTMLInputElement).value = "";
-    }
-    setUploading(false);
-    refresh();
   }
 
-  async function deleteFile(fileId: number) {
-    if (!confirm("Delete this file?")) return;
-    await fetch(`/api/files/${fileId}`, { method: "DELETE" });
-    refresh();
+  async function deleteFile(file: FileRecord) {
+    if (archived || busy || !confirm(`Delete "${file.filename}"? This removes the document from storage and this load.`)) return;
+    if (!begin(`delete:${file.id}`)) return;
+    setUploadError("");
+    try {
+      await requestJson<{ ok: boolean }>(`/api/files/${file.id}`, { method: "DELETE" });
+      setLoad((current) => current ? { ...current, files: current.files.filter((item) => item.id !== file.id) } : current);
+    } catch (failure: unknown) {
+      setUploadError(`Could not delete "${file.filename}": ${errorMessage(failure)}`);
+    } finally {
+      finish();
+    }
   }
 
-  async function deleteLoad() {
-    if (!confirm(`Delete ${load?.load_type === "loadout" ? "Loadout" : "Load"} #${load?.load_number}? Files in storage are kept, but the load record is removed.`)) return;
-    await fetch(`/api/loads/${id}`, { method: "DELETE" });
-    router.push("/");
+  async function toggleArchive() {
+    if (!load || busy) return;
+    if (!archived && (editing || notes !== load.notes || files.length > 0)) {
+      setActionError("Before archiving, save or cancel detail edits, save or discard unsaved notes, and upload or clear selected files.");
+      return;
+    }
+    const folder = `${load.load_type === "loadout" ? "Loadout" : "Load"} #${load.load_number}`;
+    const storageMessage = archived
+      ? "An existing archived folder will have its Archived - prefix removed. If the folder was deleted, recover it and its documents at the original storage location before restoring."
+      : `An existing load folder will be renamed to "Archived - ${folder}" without changing document filenames. If the folder was deleted, only the record is archived; no documents are recreated.`;
+    if (!confirm(`${archived ? "Restore" : "Archive"} ${folder}?\n\n${storageMessage}\n\n${archived ? "The load returns to the active board and can be edited." : "The load becomes read-only in the Archived view."}`)) return;
+    if (!begin("archive")) return;
+    setActionError("");
+    try {
+      acceptLoad(await requestJson<LoadDetail>(`${loadUrl}/archive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: !archived }),
+      }));
+    } catch (failure: unknown) {
+      setActionError(`${archived ? "Restore" : "Archive"} failed: ${errorMessage(failure)}`);
+    } finally {
+      finish();
+    }
   }
 
   if (!load) {
     return (
-      <div className="py-24 text-center text-[13px] text-slate-400">Loading load…</div>
+      <div className="mx-auto max-w-[860px]">
+        <Link href={returnTo} className="mb-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-slate-500 hover:text-slate-800">
+          <IconArrowLeft className="h-3.5 w-3.5" /> Load Board
+        </Link>
+        {loading ? (
+          <div role="status" className="py-24 text-center text-[13px] text-slate-400">Loading load…</div>
+        ) : (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-5 text-[13px] text-red-800">
+            <h1 className="mb-1 text-lg font-semibold">Unable to open this load</h1>
+            <p>{loadError || "The load could not be found."}</p>
+            <button onClick={() => void refresh()} className="mt-3 rounded-md border border-red-300 bg-white px-3 py-1.5 font-semibold hover:bg-red-50">Retry</button>
+          </div>
+        )}
+      </div>
     );
   }
 
   const typeLabel = load.load_type === "loadout" ? "Loadout" : "Load";
   const currentIdx = STATUSES.findIndex((s) => s.value === load.status);
+  const overdue = today ? overdueLabel(load, today) : "";
+  const hasUnsavedNotes = notes !== load.notes;
 
   return (
     <div className="mx-auto max-w-[860px]">
       <Link
-        href="/"
+        href={returnTo}
         className="mb-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-slate-500 transition-colors hover:text-slate-800"
       >
         <IconArrowLeft className="h-3.5 w-3.5" />
@@ -183,7 +281,7 @@ export default function LoadDetailPage() {
       </Link>
 
       {/* Header */}
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="flex items-center gap-2.5">
             <h1 className="font-mono text-[22px] font-semibold tracking-tight text-slate-900">
@@ -198,23 +296,38 @@ export default function LoadDetailPage() {
           <div className="mt-1 flex items-center gap-1.5 text-[12.5px] text-slate-500">
             <IconFolder className="h-3.5 w-3.5" />
             <span title={load.folder_ref}>
-              {load.driver_name} / {load.load_type === "loadout" ? "Loadout" : "Loads"} / {typeLabel} #{load.load_number}
+              {load.driver_name} / {typeLabel} #{load.load_number}
             </span>
           </div>
         </div>
         <button
-          onClick={deleteLoad}
-          className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-slate-600 shadow-sm transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700"
+          onClick={toggleArchive}
+          disabled={busy}
+          className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-slate-600 shadow-sm transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50"
         >
-          <IconTrash className="h-3.5 w-3.5" />
-          Delete
+          <IconFolder className="h-3.5 w-3.5" />
+          {pending === "archive" ? (archived ? "Restoring…" : "Archiving…") : (archived ? "Restore" : "Archive")}
         </button>
       </div>
 
+      {archived && (
+        <div role="status" className="mb-5 rounded-md border border-slate-300 bg-slate-100 px-4 py-3 text-[13px] text-slate-700">
+          <strong>Archived — read only.</strong> Restore the load to edit it or its paperwork. Documents remain available only if they still exist in storage. If the folder was deleted, recover it and its documents at the original location before restoring.
+          <div className="mt-1 break-all font-mono text-xs">Storage reference: {load.folder_ref || "Not linked"}</div>
+        </div>
+      )}
+      {overdue && (
+        <div role="status" className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-800">
+          <strong>{overdue}.</strong> {overdue === "Payment overdue" ? `Invoice due ${load.invoice_due_date}.` : `Delivery due ${load.delivery_date}.`}
+        </div>
+      )}
+      {actionError && <div role="alert" className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-800">{actionError}</div>}
+
       {/* Status pipeline */}
       <div className="mb-5 rounded-lg border border-slate-200/80 bg-white p-5 shadow-sm">
-        <div className="mb-4 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-          Status Pipeline
+        <div className="mb-4 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+          <span>Status Pipeline</span>
+          {pending === "status" && <span role="status">Updating…</span>}
         </div>
         <div className="flex items-center">
           {STATUSES.map((s, i) => {
@@ -227,8 +340,10 @@ export default function LoadDetailPage() {
                 )}
                 <button
                   onClick={() => updateStatus(s.value)}
-                  title={`Mark as ${s.label}`}
-                  className="group mx-1.5 flex flex-col items-center gap-1.5 focus:outline-none"
+                  disabled={archived || busy || current}
+                  aria-current={current ? "step" : undefined}
+                  title={archived ? "Restore this load to update its status" : `Mark as ${s.label}`}
+                  className="group mx-1.5 flex flex-col items-center gap-1.5 rounded-md focus-visible:outline-blue-600 disabled:cursor-default"
                 >
                   <span
                     className={`flex h-6 w-6 items-center justify-center rounded-full border-2 text-[10px] font-bold transition-all group-hover:scale-110 ${
@@ -267,34 +382,44 @@ export default function LoadDetailPage() {
           <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
             Trip Details
           </div>
-          {!editing ? (
+          {!editing && !archived ? (
             <button
               onClick={startEdit}
-              className="rounded-md px-2.5 py-1 text-[12px] font-medium text-blue-700 transition-colors hover:bg-blue-50"
+              disabled={busy}
+              className="rounded-md px-2.5 py-1 text-[12px] font-medium text-blue-700 transition-colors hover:bg-blue-50 disabled:opacity-50"
             >
               Edit Details
             </button>
-          ) : (
+          ) : editing ? (
             <div className="flex items-center gap-1.5">
               <button
                 onClick={() => setEditing(false)}
-                className="rounded-md px-2.5 py-1 text-[12px] font-medium text-slate-500 transition-colors hover:bg-slate-100"
+                disabled={busy}
+                className="rounded-md px-2.5 py-1 text-[12px] font-medium text-slate-500 transition-colors hover:bg-slate-100 disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
-                onClick={saveEdit}
-                disabled={savingEdit}
+                type="submit"
+                form="trip-details-form"
+                disabled={busy}
                 className="rounded-md bg-blue-600 px-3 py-1 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-blue-700 disabled:opacity-50"
               >
-                {savingEdit ? "Saving…" : "Save Changes"}
+                {pending === "edit" ? "Saving…" : "Save Changes"}
               </button>
             </div>
-          )}
+          ) : null}
         </div>
 
+        {driverError && !archived && (
+          <div role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-[12.5px] text-amber-900">
+            Driver reassignment is unavailable: {driverError}{" "}
+            <button disabled={busy || driversLoading} onClick={() => void refreshDrivers()} className="font-semibold underline disabled:opacity-50">Retry drivers</button>
+          </div>
+        )}
+
         {!editing ? (
-          <div className="grid grid-cols-2 gap-px bg-slate-200/60 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-px bg-slate-200/60 sm:grid-cols-3">
             <div className="bg-white px-4 py-3.5">
               <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Driver</div>
               <div className="mt-1 flex items-center gap-2">
@@ -311,9 +436,21 @@ export default function LoadDetailPage() {
               </div>
             </div>
             <div className="bg-white px-4 py-3.5">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Dates</div>
+              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Pickup date</div>
               <div className="tnum mt-1 text-[13px] font-semibold text-slate-900">
-                {load.pickup_date ? `${load.pickup_date} → ${load.delivery_date}` : "—"}
+                {load.pickup_date || "—"}
+              </div>
+            </div>
+            <div className="bg-white px-4 py-3.5">
+              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Delivery date</div>
+              <div className="tnum mt-1 text-[13px] font-semibold text-slate-900">
+                {load.delivery_date || "—"}
+              </div>
+            </div>
+            <div className="bg-white px-4 py-3.5">
+              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Invoice due date</div>
+              <div className="tnum mt-1 text-[13px] font-semibold text-slate-900">
+                {load.invoice_due_date || "Not set"}
               </div>
             </div>
             <div className="bg-white px-4 py-3.5">
@@ -324,12 +461,34 @@ export default function LoadDetailPage() {
             </div>
           </div>
         ) : (
-          <div className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-3">
+          <form id="trip-details-form" onSubmit={saveEdit}>
+          <fieldset disabled={busy || archived} className="grid min-w-0 grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="sm:col-span-2 lg:col-span-3">
+              <label htmlFor="edit-driver" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">Driver</label>
+              <select
+                id="edit-driver"
+                value={edit.driver_id}
+                required
+                disabled={driversLoading || Boolean(driverError)}
+                onChange={(e) => setEdit({ ...edit, driver_id: e.target.value })}
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-60"
+              >
+                {!drivers.some((driver) => driver.id === load.driver_id) && (
+                  <option value={load.driver_id}>{load.driver_name}</option>
+                )}
+                {drivers.map((driver) => <option key={driver.id} value={driver.id}>{driver.name}</option>)}
+              </select>
+              {driversLoading && <p role="status" className="mt-1 text-[11.5px] text-slate-500">Loading driver roster…</p>}
+              {edit.driver_id !== String(load.driver_id) && (
+                <p className="mt-1 text-[11.5px] text-amber-700">Saving will move this load&apos;s folder and paperwork under the selected driver. Individual document filenames stay unchanged.</p>
+              )}
+            </div>
             <div>
-              <label className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
+              <label htmlFor="edit-pickup-city" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
                 Pickup City
               </label>
               <input
+                id="edit-pickup-city"
                 value={edit.pickup_city}
                 onChange={(e) => setEdit({ ...edit, pickup_city: e.target.value })}
                 placeholder="e.g. Dallas, TX"
@@ -337,10 +496,11 @@ export default function LoadDetailPage() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
+              <label htmlFor="edit-delivery-city" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
                 Delivery City
               </label>
               <input
+                id="edit-delivery-city"
                 value={edit.delivery_city}
                 onChange={(e) => setEdit({ ...edit, delivery_city: e.target.value })}
                 placeholder="e.g. Atlanta, GA"
@@ -348,10 +508,11 @@ export default function LoadDetailPage() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
+              <label htmlFor="edit-rate" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
                 Rate ($)
               </label>
               <input
+                id="edit-rate"
                 type="number"
                 min="0"
                 step="0.01"
@@ -362,10 +523,11 @@ export default function LoadDetailPage() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
+              <label htmlFor="edit-pickup-date" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
                 Pickup Date
               </label>
               <input
+                id="edit-pickup-date"
                 type="date"
                 value={edit.pickup_date}
                 onChange={(e) => setEdit({ ...edit, pickup_date: e.target.value })}
@@ -373,20 +535,34 @@ export default function LoadDetailPage() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
+              <label htmlFor="edit-delivery-date" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">
                 Delivery Date
               </label>
               <input
+                id="edit-delivery-date"
                 type="date"
                 value={edit.delivery_date}
+                min={edit.pickup_date || undefined}
                 onChange={(e) => setEdit({ ...edit, delivery_date: e.target.value })}
                 className="tnum w-full rounded-md border border-slate-300 px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
               />
             </div>
-          </div>
+            <div>
+              <label htmlFor="edit-invoice-due-date" className="mb-1 block text-[11.5px] font-medium uppercase tracking-wide text-slate-500">Invoice Due Date</label>
+              <input
+                id="edit-invoice-due-date"
+                type="date"
+                value={edit.invoice_due_date}
+                onChange={(e) => setEdit({ ...edit, invoice_due_date: e.target.value })}
+                className="tnum w-full rounded-md border border-slate-300 px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+              />
+              <p className="mt-1 text-[11.5px] text-slate-500">Optional. Use the agreed payment date; no automatic payment terms are applied.</p>
+            </div>
+          </fieldset>
+          </form>
         )}
-        {error && editing && (
-          <div className="border-t border-slate-100 px-4 py-2 text-[12.5px] text-red-600">{error}</div>
+        {editError && editing && (
+          <div role="alert" className="border-t border-slate-100 px-4 py-2 text-[12.5px] text-red-600">{editError}</div>
         )}
       </div>
 
@@ -414,6 +590,7 @@ export default function LoadDetailPage() {
                   <a
                     href={f.web_link || `/api/files/${f.id}`}
                     target="_blank"
+                    rel="noopener noreferrer"
                     className="block truncate text-[13px] font-medium text-slate-800 hover:text-blue-700 hover:underline"
                   >
                     {f.filename}
@@ -426,26 +603,33 @@ export default function LoadDetailPage() {
                     <span className="tnum">{f.uploaded_at}</span>
                   </div>
                 </div>
-                <button
-                  onClick={() => deleteFile(f.id)}
-                  title="Delete file"
-                  className="rounded-md p-1.5 text-slate-300 opacity-0 transition-all hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
-                >
-                  <IconTrash className="h-4 w-4" />
-                </button>
+                {!archived && (
+                  <button
+                    onClick={() => deleteFile(f)}
+                    disabled={busy}
+                    aria-label={`Delete ${f.filename}`}
+                    title={pending === `delete:${f.id}` ? "Deleting…" : "Delete file"}
+                    className="rounded-md p-1.5 text-slate-400 transition-all hover:bg-red-50 hover:text-red-600 focus:opacity-100 disabled:opacity-40 sm:opacity-0 sm:group-hover:opacity-100"
+                  >
+                    {pending === `delete:${f.id}` ? <span className="text-[11px]">Deleting…</span> : <IconTrash className="h-4 w-4" />}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
         )}
 
+        {!archived ? (
         <form
           onSubmit={uploadFiles}
           className="border-t border-slate-200/80 bg-slate-50/50 px-5 py-3.5"
         >
+          <fieldset disabled={busy} className="min-w-0">
           <div className="flex flex-wrap items-center gap-2.5">
             <select
               value={category}
-              onChange={(e) => setCategory(e.target.value)}
+              onChange={(e) => setCategory(e.target.value as FileCategory)}
+              aria-label="Document category"
               className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-[12.5px] shadow-sm focus:border-blue-500 focus:outline-none"
             >
               {CATEGORIES.map((c) => (
@@ -456,10 +640,14 @@ export default function LoadDetailPage() {
             </select>
             <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md border border-dashed border-slate-300 bg-white px-3 py-1.5 text-[12.5px] text-slate-500 transition-colors hover:border-slate-400">
               <input
+                ref={fileInput}
                 id="file-input"
                 type="file"
                 multiple
-                onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+                onChange={(e) => {
+                  setFiles(Array.from(e.target.files ?? []));
+                  setUploadError("");
+                }}
                 className="sr-only"
               />
               <IconUpload className="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -473,17 +661,29 @@ export default function LoadDetailPage() {
             </label>
             <button
               type="submit"
-              disabled={files.length === 0 || uploading}
+              disabled={files.length === 0 || busy}
               className="rounded-md bg-blue-600 px-4 py-1.5 text-[12.5px] font-medium text-white shadow-sm transition-colors hover:bg-blue-700 disabled:opacity-50"
             >
-              {uploading
+              {pending === "upload"
                 ? "Uploading…"
                 : files.length > 1
                   ? `Upload ${files.length} Files`
                   : "Upload"}
             </button>
+            {files.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFiles([]);
+                  if (fileInput.current) fileInput.current.value = "";
+                }}
+                className="rounded-md px-2 py-1.5 text-[12px] font-medium text-slate-500 hover:bg-slate-100"
+              >
+                Clear selection
+              </button>
+            )}
           </div>
-          {files.length > 1 && (
+          {files.length > 0 && (
             <ul className="mt-2 flex flex-wrap gap-1.5">
               {files.map((f, i) => (
                 <li
@@ -495,7 +695,10 @@ export default function LoadDetailPage() {
                   <button
                     type="button"
                     title="Remove from selection"
-                    onClick={() => setFiles(files.filter((_, j) => j !== i))}
+                    onClick={() => {
+                      setFiles(files.filter((_, j) => j !== i));
+                      if (fileInput.current) fileInput.current.value = "";
+                    }}
                     className="ml-0.5 text-slate-400 hover:text-red-600"
                   >
                     ×
@@ -504,8 +707,12 @@ export default function LoadDetailPage() {
               ))}
             </ul>
           )}
-          {error && <div className="mt-2 text-[12.5px] text-red-600">{error}</div>}
+          </fieldset>
         </form>
+        ) : (
+          <p className="border-t border-slate-200/80 bg-slate-50/50 px-5 py-3.5 text-[12.5px] text-slate-500">Restore this load to upload or delete documents.</p>
+        )}
+        {uploadError && <div role="alert" className="px-5 py-3 text-[12.5px] text-red-600">{uploadError}</div>}
       </div>
 
       {/* Notes */}
@@ -516,20 +723,48 @@ export default function LoadDetailPage() {
         <div className="p-5">
           <textarea
             value={notes}
-            onChange={(e) => setNotes(e.target.value)}
+            onChange={(e) => {
+              setNotes(e.target.value);
+              notesDraft.current = e.target.value;
+              notesDirty.current = e.target.value !== load.notes;
+              setNotesSaved(false);
+            }}
+            aria-label="Dispatch notes"
+            readOnly={archived}
+            disabled={busy}
             rows={3}
             placeholder="Notes for this load — lumper info, detention, check calls…"
-            className="w-full rounded-md border border-slate-300 px-3 py-2 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+            className="w-full rounded-md border border-slate-300 px-3 py-2 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:bg-slate-50"
           />
-          <div className="mt-2.5 flex items-center gap-3">
+          {!archived && <div className="mt-2.5 flex flex-wrap items-center gap-3">
             <button
               onClick={saveNotes}
-              className="rounded-md bg-slate-800 px-4 py-1.5 text-[12.5px] font-medium text-white shadow-sm transition-colors hover:bg-slate-900"
+              disabled={busy || !hasUnsavedNotes}
+              className="rounded-md bg-slate-800 px-4 py-1.5 text-[12.5px] font-medium text-white shadow-sm transition-colors hover:bg-slate-900 disabled:opacity-50"
             >
-              Save Notes
+              {pending === "notes" ? "Saving…" : "Save Notes"}
             </button>
-            {notesSaved && <span className="text-[12.5px] font-medium text-emerald-600">Saved ✓</span>}
-          </div>
+            {hasUnsavedNotes && (
+              <>
+                <button
+                  disabled={busy}
+                  onClick={() => {
+                    setNotes(load.notes);
+                    notesDraft.current = load.notes;
+                    notesDirty.current = false;
+                    setNotesSaved(false);
+                    setNotesError("");
+                  }}
+                  className="rounded-md px-2 py-1.5 text-[12px] font-medium text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+                >
+                  Discard changes
+                </button>
+                <span className="text-[12px] text-amber-700">Unsaved changes</span>
+              </>
+            )}
+            {notesSaved && !hasUnsavedNotes && <span role="status" className="text-[12.5px] font-medium text-emerald-600">Saved ✓</span>}
+          </div>}
+          {notesError && <p role="alert" className="mt-2 text-[12.5px] text-red-600">{notesError}</p>}
         </div>
       </div>
     </div>

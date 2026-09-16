@@ -1,13 +1,12 @@
 import Database from "better-sqlite3";
-import path from "path";
 import fs from "fs";
-import { getStorageMode } from "./config";
+import { getDataPaths } from "./config";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const paths = getDataPaths();
+fs.mkdirSync(paths.data, { recursive: true });
 
-const databaseFile = getStorageMode() === "local" ? "dispatch-local.db" : "dispatch.db";
-const db = new Database(path.join(DATA_DIR, databaseFile));
+export const databasePath = paths.database;
+const db = new Database(databasePath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
@@ -31,6 +30,8 @@ CREATE TABLE IF NOT EXISTS loads (
   delivery_date TEXT NOT NULL,
   rate_amount REAL NOT NULL,
   status TEXT NOT NULL DEFAULT 'scheduled',
+  invoice_due_date TEXT NOT NULL DEFAULT '',
+  archived_at TEXT DEFAULT NULL,
   folder_ref TEXT DEFAULT '',
   notes TEXT DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -49,26 +50,19 @@ CREATE TABLE IF NOT EXISTS files (
 );
 `);
 
-export const LOAD_STATUSES = [
-  "scheduled",
-  "picked_up",
-  "unloaded",
-  "invoiced",
-  "paid",
-] as const;
+db.transaction(() => {
+  const columns = db.prepare<[], { name: string }>("PRAGMA table_info(loads)").all();
+  if (!columns.some((column) => column.name === "archived_at")) {
+    db.exec("ALTER TABLE loads ADD COLUMN archived_at TEXT DEFAULT NULL");
+  }
+  if (!columns.some((column) => column.name === "invoice_due_date")) {
+    db.exec("ALTER TABLE loads ADD COLUMN invoice_due_date TEXT NOT NULL DEFAULT ''");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS loads_driver_archive ON loads(driver_id, archived_at)");
+  db.pragma("user_version = 1");
+}).immediate();
 
-export type LoadStatus = (typeof LOAD_STATUSES)[number];
-
-export const LOAD_TYPES = ["load", "loadout"] as const;
-export type LoadType = (typeof LOAD_TYPES)[number];
-
-export const FILE_CATEGORIES = [
-  "rate_confirmation",
-  "updated_rate_confirmation",
-  "bol",
-  "lumper_receipt",
-  "invoice",
-  "other",
-] as const;
+export { LOAD_STATUSES, LOAD_TYPES, FILE_CATEGORIES } from "./models";
+export type { LoadStatus, LoadType } from "./models";
 
 export default db;

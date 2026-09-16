@@ -2,18 +2,28 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { IconTruck, IconPlus, IconUsers } from "./icons";
+import { usePathname, useRouter } from "next/navigation";
+import { sanitizeBoardReturnUrl } from "@/lib/board-navigation";
+import { IconTruck, IconPlus, IconUsers, IconFolder } from "./icons";
 
 const nav = [
   { href: "/", label: "Load Board", icon: IconTruck },
   { href: "/loads/new", label: "Book Load", icon: IconPlus },
   { href: "/drivers", label: "Drivers", icon: IconUsers },
+  { href: "/backups", label: "Backups", icon: IconFolder },
 ];
+
+function currentBoardHref(): string {
+  return /^\/loads\/[^/]+\/?$/.test(window.location.pathname)
+    ? sanitizeBoardReturnUrl(new URLSearchParams(window.location.search).get("returnTo"))
+    : "/";
+}
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const [storageMode, setStorageMode] = useState<string>("");
+  const [boardHref, setBoardHref] = useState("/");
 
   useEffect(() => {
     fetch("/api/status")
@@ -21,6 +31,27 @@ export default function Sidebar() {
       .then((d) => setStorageMode(d.storage))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    setBoardHref(currentBoardHref());
+  }, [pathname]);
+
+  function refreshBoardHref(event: React.SyntheticEvent<HTMLAnchorElement>) {
+    const href = currentBoardHref();
+    event.currentTarget.href = href;
+    setBoardHref(href);
+    return href;
+  }
+
+  function navigateToBoard(event: React.MouseEvent<HTMLAnchorElement>) {
+    if (event.defaultPrevented) return;
+    // Read on activation as well, so query-only navigation cannot leave a stale return URL.
+    const href = refreshBoardHref(event);
+    if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+      event.preventDefault();
+      router.push(href);
+    }
+  }
 
   return (
     <aside className="fixed inset-y-0 left-0 z-40 flex w-[232px] flex-col border-r border-[#1d2939] bg-[#101828]">
@@ -44,7 +75,10 @@ export default function Sidebar() {
           return (
             <Link
               key={item.href}
-              href={item.href}
+              href={item.href === "/" ? boardHref : item.href}
+              onClick={item.href === "/" ? navigateToBoard : undefined}
+              onAuxClick={item.href === "/" ? refreshBoardHref : undefined}
+              onContextMenu={item.href === "/" ? refreshBoardHref : undefined}
               className={`group flex items-center gap-3 rounded-md px-3 py-2 text-[13px] font-medium transition-colors ${
                 active
                   ? "bg-white/[0.06] text-white"
