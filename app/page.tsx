@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
-import { STATUSES, fmtMoney, loadTypeLabel, initials } from "@/lib/constants";
+import { STATUSES, LOAD_TYPE_OPTIONS, fmtMoney, loadTypeLabel, initials } from "@/lib/constants";
 import { IconPlus, IconSearch, IconSync, IconTruck, IconRoute, IconDollar, IconFile, IconChevronDown } from "@/components/icons";
 
 interface LoadRow {
@@ -20,28 +20,75 @@ interface LoadRow {
   status: string;
 }
 
+interface Driver {
+  id: number;
+  name: string;
+}
+
 export default function Dashboard() {
   const router = useRouter();
   const [loads, setLoads] = useState<LoadRow[]>([]);
+  const [drivers, setDrivers] = useState<Driver[]>([]);
   const [statusFilter, setStatusFilter] = useState("");
+  const [driverFilter, setDriverFilter] = useState("");
+  const [loadTypeFilter, setLoadTypeFilter] = useState("");
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [driverError, setDriverError] = useState("");
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
 
-  const refresh = useCallback(async () => {
-    const params = new URLSearchParams();
-    if (statusFilter) params.set("status", statusFilter);
-    if (q) params.set("q", q);
-    const res = await fetch(`/api/loads?${params}`);
-    setLoads(await res.json());
-    setLoading(false);
-  }, [statusFilter, q]);
+  const refresh = useCallback(() => setRefreshVersion((version) => version + 1), []);
 
   useEffect(() => {
-    const t = setTimeout(refresh, q ? 250 : 0);
-    return () => clearTimeout(t);
-  }, [refresh, q]);
+    const controller = new AbortController();
+    fetch("/api/drivers", { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error("Failed to load the driver filter.");
+        return res.json();
+      })
+      .then((data: Driver[]) => {
+        if (!controller.signal.aborted) setDrivers(data);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setDriverError(error instanceof Error ? error.message : "Failed to load the driver filter.");
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function fetchLoads() {
+      const params = new URLSearchParams();
+      if (statusFilter) params.set("status", statusFilter);
+      if (driverFilter) params.set("driver_id", driverFilter);
+      if (loadTypeFilter) params.set("load_type", loadTypeFilter);
+      if (q) params.set("q", q);
+      setLoading(true);
+      setLoadError("");
+      try {
+        const res = await fetch(`/api/loads?${params}`, { signal: controller.signal });
+        if (!res.ok) throw new Error("Failed to load loads.");
+        const data: LoadRow[] = await res.json();
+        if (!controller.signal.aborted) setLoads(data);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setLoadError(error instanceof Error ? error.message : "Failed to load loads.");
+        }
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }
+    const t = setTimeout(fetchLoads, q ? 250 : 0);
+    return () => {
+      clearTimeout(t);
+      controller.abort();
+    };
+  }, [statusFilter, driverFilter, loadTypeFilter, q, refreshVersion]);
 
   async function updateStatus(id: number, status: string) {
     await fetch(`/api/loads/${id}`, {
@@ -141,6 +188,59 @@ export default function Dashboard() {
       </div>
 
       {/* Filters */}
+      <div className="mb-3 flex flex-wrap items-end gap-3">
+        <div>
+          <label htmlFor="driver-filter" className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+            Driver
+          </label>
+          <select
+            id="driver-filter"
+            value={driverFilter}
+            onChange={(e) => setDriverFilter(e.target.value)}
+            className="w-48 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+          >
+            <option value="">All drivers</option>
+            {drivers.map((driver) => (
+              <option key={driver.id} value={driver.id}>
+                {driver.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="load-type-filter" className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+            Load Type
+          </label>
+          <select
+            id="load-type-filter"
+            value={loadTypeFilter}
+            onChange={(e) => setLoadTypeFilter(e.target.value)}
+            className="w-44 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+          >
+            <option value="">All load types</option>
+            {LOAD_TYPE_OPTIONS.map((type) => (
+              <option key={type.value} value={type.value}>
+                {loadTypeLabel(type.value)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="relative ml-auto">
+          <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search load #, city, driver…"
+            aria-label="Search loads"
+            className="w-72 rounded-md border border-slate-300 bg-white py-1.5 pl-9 pr-3 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+          />
+        </div>
+      </div>
+      {(driverError || loadError) && (
+        <div role="alert" className="mb-3 rounded-md border border-red-200 bg-red-50 px-4 py-2.5 text-[13px] text-red-800">
+          {[driverError, loadError].filter(Boolean).join(" ")}
+        </div>
+      )}
       <div className="mb-3 flex flex-wrap items-center gap-1.5">
         <button
           onClick={() => setStatusFilter("")}
@@ -167,15 +267,6 @@ export default function Dashboard() {
             {statusFilter === "" && <span className="tnum text-slate-400">{s.count}</span>}
           </button>
         ))}
-        <div className="relative ml-auto">
-          <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search load #, city, driver…"
-            className="w-72 rounded-md border border-slate-300 bg-white py-1.5 pl-9 pr-3 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-          />
-        </div>
       </div>
 
       {/* Table */}
@@ -200,13 +291,21 @@ export default function Dashboard() {
                   Loading loads…
                 </td>
               </tr>
+            ) : loadError ? (
+              <tr>
+                <td colSpan={8} className="px-4 py-16 text-center text-[13px] text-red-600">
+                  Unable to display loads. Please try again.
+                </td>
+              </tr>
             ) : loads.length === 0 ? (
               <tr>
                 <td colSpan={8} className="px-4 py-16 text-center">
                   <IconTruck className="mx-auto mb-3 h-8 w-8 text-slate-300" />
                   <div className="text-[14px] font-medium text-slate-600">No loads found</div>
                   <div className="mt-1 text-[13px] text-slate-400">
-                    Book a load or sync existing folders from storage.
+                    {driverFilter || loadTypeFilter || statusFilter || q
+                      ? "Try changing your filters or search."
+                      : "Book a load or sync existing folders from storage."}
                   </div>
                 </td>
               </tr>

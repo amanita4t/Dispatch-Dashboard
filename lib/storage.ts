@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { Readable } from "stream";
 import type { LoadType } from "./db";
+import { getStorageMode, type StorageMode } from "./config";
 
 export interface SavedFile {
   storageRef: string; // local path or Drive file id
@@ -23,7 +24,7 @@ export interface StorageFileEntry {
 }
 
 export interface StorageProvider {
-  readonly mode: "local" | "drive";
+  readonly mode: StorageMode;
   /** True if the load/loadout folder already exists in storage. */
   loadFolderExists(driverName: string, loadNumber: string, loadType: LoadType): Promise<boolean>;
   /** Ensures Driver/<Loads|Loadout>/<Load|Loadout> #<num> folder exists; returns a folder ref. */
@@ -411,7 +412,11 @@ let provider: StorageProvider | null = null;
 
 export function getStorage(): StorageProvider {
   if (!provider) {
-    provider = driveConfigured() ? new DriveStorage() : new LocalStorage();
+    const mode = getStorageMode();
+    if (mode === "drive" && !driveConfigured()) {
+      throw new Error("Google Drive mode requires Google credentials and GOOGLE_DRIVE_ROOT_FOLDER_ID");
+    }
+    provider = mode === "drive" ? new DriveStorage() : new LocalStorage();
   }
   return provider;
 }

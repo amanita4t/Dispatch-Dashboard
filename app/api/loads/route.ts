@@ -7,14 +7,31 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const status = url.searchParams.get("status");
+  const driverId = url.searchParams.get("driver_id");
+  const loadType = url.searchParams.get("load_type");
   const q = url.searchParams.get("q");
 
   let sql = `SELECT l.*, d.name AS driver_name FROM loads l JOIN drivers d ON d.id = l.driver_id`;
   const where: string[] = [];
-  const args: any[] = [];
+  const args: (string | number)[] = [];
   if (status && (LOAD_STATUSES as readonly string[]).includes(status)) {
     where.push("l.status = ?");
     args.push(status);
+  }
+  if (driverId) {
+    const id = Number(driverId);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      return NextResponse.json({ error: "Invalid driver ID" }, { status: 400 });
+    }
+    where.push("l.driver_id = ?");
+    args.push(id);
+  }
+  if (loadType) {
+    if (!(LOAD_TYPES as readonly string[]).includes(loadType)) {
+      return NextResponse.json({ error: "Invalid load type" }, { status: 400 });
+    }
+    where.push("l.load_type = ?");
+    args.push(loadType);
   }
   if (q) {
     where.push("(l.load_number LIKE ? OR l.pickup_city LIKE ? OR l.delivery_city LIKE ? OR d.name LIKE ?)");

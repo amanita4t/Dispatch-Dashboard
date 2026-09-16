@@ -70,12 +70,12 @@ export default function Sidebar() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
             </span>
-            Google Drive connected
+            Google Drive mode
           </div>
         ) : storageMode === "local" ? (
           <div
             className="flex items-center gap-2 text-[11px] font-medium text-slate-500"
-            title="Add Google credentials to .env.local to enable Drive"
+            title="Files are stored locally. Set STORAGE_MODE=drive with Google credentials to enable Drive."
           >
             <span className="inline-flex h-2 w-2 rounded-full bg-slate-600" />
             Local storage mode

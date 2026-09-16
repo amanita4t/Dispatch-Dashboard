@@ -1,11 +1,13 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
+import { getStorageMode } from "./config";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, "dispatch.db"));
+const databaseFile = getStorageMode() === "local" ? "dispatch-local.db" : "dispatch.db";
+const db = new Database(path.join(DATA_DIR, databaseFile));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
