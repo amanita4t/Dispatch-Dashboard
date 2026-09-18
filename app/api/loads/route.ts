@@ -4,9 +4,11 @@ import { withDataLock } from "@/lib/mutation-lock";
 import { createLoad, listLoads } from "@/lib/loads";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 300;
 
 export async function GET(req: Request) {
-  return apiHandler(() => withDataLock(() => NextResponse.json(listLoads(new URL(req.url).searchParams))));
+  return apiHandler(async () => NextResponse.json(await listLoads(new URL(req.url).searchParams)));
 }
 
 export async function POST(req: Request) {

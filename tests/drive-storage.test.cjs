@@ -5,18 +5,155 @@ const { DriveStorage, loadFolderName, movedReference } = require("../lib/storage
 
 function mockedDrive(t, parent = "original-parent") {
   const updates = [];
+  const creates = [];
   const storage = new DriveStorage();
   const files = {
     get: async () => ({ data: { id: "load-id", name: "Load #100", mimeType: "application/vnd.google-apps.folder", parents: ["original-parent"] } }),
     list: async () => ({ data: { files: [] } }),
     update: async (request) => { updates.push(request); return { data: {} }; },
+    create: async (request) => { creates.push(request); return { data: { id: `created-${creates.length}` } }; },
   };
   t.mock.method(storage, "drive", async () => ({ files }));
   t.mock.method(storage, "rootFolderId", () => "root-id");
   t.mock.method(storage, "driverFolder", async () => "driver-root");
   t.mock.method(storage, "typeFolder", async () => parent);
-  return { storage, files, updates };
+  return { storage, files, updates, creates };
 }
+
+test("Drive creates both load types directly beside existing active or archived load folders", async (t) => {
+  for (const seed of ["Load #EXISTING", "Loadout #EXISTING", "Archived - Load #EXISTING", "Archived - Loadout #EXISTING"]) {
+    const { storage, files, updates, creates } = mockedDrive(t, null);
+    t.mock.method(storage, "typeFolder", async (_name, _type, create) => {
+      assert.equal(create, false, "A flat driver layout must not acquire a grouping folder");
+      return null;
+    });
+    files.list = async (request) => ({ data: { files: request.q.startsWith("name =") ? [] : [
+      { id: "existing-load", name: seed, createdTime: "2026-09-01T12:00:00Z" },
+    ] } });
+    for (const type of ["load", "loadout"]) {
+      const id = await storage.createLoadFolder("Driver", "NEW", type);
+      assert.equal(id, `created-${creates.length}`);
+      assert.deepEqual(creates.at(-1).requestBody, {
+        name: loadFolderName("NEW", type), mimeType: "application/vnd.google-apps.folder", parents: ["driver-root"],
+      });
+    }
+    assert.equal(creates.length, 2);
+    assert.equal(updates.length, 0);
+  }
+});
+
+test("Drive booking uses an existing matching container without inspecting or changing the flat layout", async (t) => {
+  const { storage, creates, updates } = mockedDrive(t, "typed-parent");
+  t.mock.method(storage, "listEntries", async () => assert.fail("An existing matching container takes precedence"));
+  for (const type of ["load", "loadout"]) {
+    await storage.createLoadFolder("Driver", "NEW", type);
+    assert.deepEqual(creates.at(-1).requestBody.parents, ["typed-parent"]);
+    assert.equal(creates.at(-1).requestBody.name, loadFolderName("NEW", type));
+  }
+  assert.equal(creates.length, 2);
+  assert.equal(updates.length, 0);
+});
+
+test("Drive retains the grouped default when no direct load folders exist", async (t) => {
+  for (const existingNames of [[], ["Loads", "Documents"]]) {
+    const { storage, files, creates } = mockedDrive(t);
+    t.mock.method(storage, "typeFolder", DriveStorage.prototype.typeFolder.bind(storage));
+    files.list = async (request) => ({ data: { files: request.q.startsWith("name =") ? [] : existingNames.map((name, index) => ({
+      id: `existing-${index}`, name, createdTime: "2026-09-01T12:00:00Z",
+    })) } });
+    await storage.createLoadFolder("Driver", "NEW", "loadout");
+    assert.equal(creates.length, 2);
+    assert.deepEqual(creates[0].requestBody, {
+      name: "Loadout", mimeType: "application/vnd.google-apps.folder", parents: ["driver-root"],
+    });
+    assert.deepEqual(creates[1].requestBody, {
+      name: "Loadout #NEW", mimeType: "application/vnd.google-apps.folder", parents: ["created-1"],
+    });
+  }
+});
+
+test("Drive layout detection reads later pages before deciding to create a grouping folder", async (t) => {
+  const { storage, files, creates } = mockedDrive(t, null);
+  const pages = [];
+  files.list = async (request) => {
+    if (request.q.startsWith("name =")) return { data: { files: [] } };
+    pages.push(request.pageToken);
+    return request.pageToken ? { data: { files: [
+      { id: "old-load", name: "Archived - Loadout #EXISTING", createdTime: "2026-09-01T12:00:00Z" },
+    ] } } : { data: { files: [], nextPageToken: "next" } };
+  };
+  await storage.createLoadFolder("Driver", "NEW", "load");
+  assert.deepEqual(pages, [undefined, "next"]);
+  assert.equal(creates.length, 1);
+  assert.deepEqual(creates[0].requestBody.parents, ["driver-root"]);
+});
+
+test("Drive layout scan failures never create a load or an extra grouping folder", async (t) => {
+  const { storage, creates } = mockedDrive(t, null);
+  t.mock.method(storage, "listEntries", async () => { throw new Error("Driver layout is unavailable"); });
+  await assert.rejects(storage.createLoadFolder("Driver", "NEW", "loadout"), /layout is unavailable/);
+  assert.equal(creates.length, 0);
+});
+
+test("Drive reassignment joins direct destination loads without creating containers", async (t) => {
+  const { storage, files, creates, updates } = mockedDrive(t, null);
+  files.list = async (request) => ({ data: { files: request.q.startsWith("name =") ? [] : [
+    { id: "existing-load", name: "Load #EXISTING", createdTime: "2026-09-01T12:00:00Z" },
+  ] } });
+  const move = await storage.moveLoadFolder("load-id", "Driver", "100", "loadout", false);
+  assert.equal(creates.length, 0);
+  assert.equal(updates[0].addParents, "driver-root");
+  assert.equal(updates[0].removeParents, "original-parent");
+  assert.equal(updates[0].requestBody.name, "Loadout #100");
+  await move.rollback();
+  assert.equal(updates[1].addParents, "original-parent");
+  assert.equal(updates[1].removeParents, "driver-root");
+});
+
+test("read-only Drive blocks every document and folder mutation before issuing an API request", async (t) => {
+  const previous = process.env.GOOGLE_DRIVE_READ_ONLY;
+  process.env.GOOGLE_DRIVE_READ_ONLY = "true";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GOOGLE_DRIVE_READ_ONLY;
+    else process.env.GOOGLE_DRIVE_READ_ONLY = previous;
+  });
+  const storage = new DriveStorage();
+  const connection = t.mock.method(storage, "drive", async () => assert.fail("Read-only mutation reached Google Drive"));
+  const rejected = (error) => error.status === 403 && /read-only/.test(error.message);
+  for (const action of [
+    () => storage.createLoadFolder("Driver", "100", "load"),
+    () => storage.removeEmptyLoadFolder("load-id"),
+    () => storage.renameDriverFolder("Driver", "New Driver"),
+    () => storage.moveLoadFolder("load-id", "Driver", "100", "load", true),
+    () => storage.moveLoadFolder("load-id", "Driver", "100", "load", false),
+    () => storage.saveFile("load-id", "file.txt", Buffer.from("document"), "text/plain"),
+    () => storage.deleteFile("file-id"),
+  ]) await assert.rejects(action, rejected);
+  assert.equal(connection.mock.callCount(), 0);
+  assert.equal(storage.readOnly, true);
+});
+
+test("read-only Drive can list and read documents without issuing mutations", async (t) => {
+  const previous = process.env.GOOGLE_DRIVE_READ_ONLY;
+  process.env.GOOGLE_DRIVE_READ_ONLY = "true";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GOOGLE_DRIVE_READ_ONLY;
+    else process.env.GOOGLE_DRIVE_READ_ONLY = previous;
+  });
+  const { storage, files, updates } = mockedDrive(t);
+  files.list = async () => ({ data: { files: [
+    { id: "existing-id", name: "rate.pdf", size: "10", createdTime: "2026-09-01T12:00:00Z" },
+  ] } });
+  const listed = await storage.listFolderFiles("load-id");
+  assert.equal(listed[0].storageRef, "existing-id");
+  files.get = async (request) => {
+    assert.equal(request.fileId, "existing-id");
+    assert.equal(request.alt, "media");
+    return { data: Buffer.from("paperwork") };
+  };
+  assert.equal((await storage.readFile("existing-id")).toString(), "paperwork");
+  assert.equal(updates.length, 0);
+});
 
 test("Drive archive keeps stable IDs and renames the actual folder", async (t) => {
   const { storage, updates } = mockedDrive(t);

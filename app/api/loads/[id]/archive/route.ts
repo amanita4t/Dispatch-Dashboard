@@ -5,6 +5,8 @@ import { withDataLock } from "@/lib/mutation-lock";
 import { positiveId } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 300;
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   return apiHandler(async () => {
@@ -12,6 +14,8 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     const body = await readJsonObject(req);
     if (typeof body.archived !== "boolean") throw new RequestError("archived must be true or false");
     const archived = body.archived;
-    return withDataLock(async () => NextResponse.json(await archiveLoad(id, archived)));
+    return withDataLock(async () => NextResponse.json(await archiveLoad(id, archived)), {
+      keys: [`load:${id}`, `storage-load:${id}`],
+    });
   });
 }

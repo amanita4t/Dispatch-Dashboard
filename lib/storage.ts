@@ -3,7 +3,7 @@ import path from "path";
 import { Readable } from "stream";
 import type { drive_v3 } from "googleapis/build/src/apis/drive/v3";
 import type { LoadType } from "./models";
-import { getDataPaths, getStorageMode, type StorageMode } from "./config";
+import { getStoragePath, getDriveReadOnly, getStorageMode, type StorageMode } from "./config";
 import { RequestError } from "./api";
 import { errorMessage, hasErrorCode } from "./errors";
 
@@ -40,6 +40,7 @@ export interface StorageMove {
 
 export interface StorageProvider {
   readonly mode: StorageMode;
+  readonly readOnly: boolean;
   listDriverFolders(): Promise<StorageDriverFolder[]>;
   loadFolderPresent(driverName: string, folderRef: string): Promise<boolean>;
   loadFolderExists(driverName: string, loadNumber: string, loadType: LoadType): Promise<boolean>;
@@ -52,6 +53,12 @@ export interface StorageProvider {
   saveFile(folderRef: string, filename: string, data: Buffer, mimeType: string): Promise<SavedFile>;
   deleteFile(storageRef: string): Promise<void>;
   readFile(storageRef: string): Promise<Buffer>;
+}
+
+export function assertStorageWritable(storage: Pick<StorageProvider, "readOnly">) {
+  if (storage.readOnly) {
+    throw new RequestError("Google Drive is read-only. Creating, uploading, deleting, renaming, and moving folders or documents are blocked.", 403);
+  }
 }
 
 export function sanitizeName(name: string): string {
@@ -73,8 +80,13 @@ export function loadFolderName(loadNumber: string, loadType: LoadType, archived 
 const LOAD_FOLDER_RES: Record<LoadType, RegExp> = { load: /^Load #(.+)$/, loadout: /^Loadout #(.+)$/ };
 const toSqlDate = (date: Date) => date.toISOString().slice(0, 19).replace("T", " ");
 
+function isLoadFolderName(name: string): boolean {
+  const activeName = name.replace(/^Archived - /, "");
+  return Object.values(LOAD_FOLDER_RES).some((pattern) => Boolean(activeName.match(pattern)?.[1].trim()));
+}
+
 function localPath(ref: string): string {
-  const root = getDataPaths().storage;
+  const root = getStoragePath();
   const resolved = path.resolve(ref);
   const relative = path.relative(root, resolved);
   if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
@@ -107,9 +119,10 @@ export function movedReference(ref: string, move: StorageMove): string {
 
 export class LocalStorage implements StorageProvider {
   readonly mode = "local" as const;
+  readonly readOnly = false;
 
   async listDriverFolders(): Promise<StorageDriverFolder[]> {
-    const root = getDataPaths().storage;
+    const root = getStoragePath();
     if (!fs.existsSync(root)) return [];
     if (fs.lstatSync(root).isSymbolicLink()) throw new RequestError("Linked storage folders are not supported", 409);
     return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => ({
@@ -119,7 +132,7 @@ export class LocalStorage implements StorageProvider {
   }
 
   async loadFolderPresent(driverName: string, folderRef: string): Promise<boolean> {
-    const driverDir = localPath(path.join(getDataPaths().storage, sanitizeName(driverName)));
+    const driverDir = localPath(path.join(getStoragePath(), sanitizeName(driverName)));
     const folder = localPath(folderRef);
     const relative = path.relative(driverDir, folder);
     if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
@@ -145,15 +158,34 @@ export class LocalStorage implements StorageProvider {
   }
 
   private folderPath(driverName: string, loadNumber: string, loadType: LoadType, archived = false) {
-    return localPath(path.join(getDataPaths().storage, sanitizeName(driverName), typeFolderName(loadType), loadFolderName(loadNumber, loadType, archived)));
+    return localPath(path.join(getStoragePath(), sanitizeName(driverName), typeFolderName(loadType), loadFolderName(loadNumber, loadType, archived)));
   }
 
   private loadLocations(driverName: string, loadNumber: string, loadType: LoadType) {
-    const driver = localPath(path.join(getDataPaths().storage, sanitizeName(driverName)));
+    const driver = localPath(path.join(getStoragePath(), sanitizeName(driverName)));
     return [false, true].flatMap((archived) => [
       this.folderPath(driverName, loadNumber, loadType, archived),
       localPath(path.join(driver, loadFolderName(loadNumber, loadType, archived))),
     ]);
+  }
+
+  private loadParent(driverName: string, loadType: LoadType): string {
+    const driver = localPath(path.join(getStoragePath(), sanitizeName(driverName)));
+    const typed = localPath(path.join(driver, typeFolderName(loadType)));
+    try {
+      if (!fs.statSync(typed).isDirectory()) throw new RequestError("The load grouping path is not a folder", 409);
+      return typed;
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) throw error;
+    }
+    try {
+      const direct = fs.readdirSync(driver, { withFileTypes: true })
+        .some((entry) => entry.isDirectory() && isLoadFolderName(entry.name));
+      return direct ? driver : typed;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return typed;
+      throw error;
+    }
   }
 
   async loadFolderExists(driverName: string, loadNumber: string, loadType: LoadType) {
@@ -164,7 +196,7 @@ export class LocalStorage implements StorageProvider {
     if (await this.loadFolderExists(driverName, loadNumber, loadType)) {
       throw new RequestError("An active or archived folder for this load already exists", 409);
     }
-    const folder = this.folderPath(driverName, loadNumber, loadType);
+    const folder = localPath(path.join(this.loadParent(driverName, loadType), loadFolderName(loadNumber, loadType)));
     fs.mkdirSync(path.dirname(folder), { recursive: true });
     fs.mkdirSync(folder);
     return folder;
@@ -175,7 +207,7 @@ export class LocalStorage implements StorageProvider {
   }
 
   async listLoadFolders(driverName: string, loadType: LoadType): Promise<StorageLoadFolder[]> {
-    const driverDir = localPath(path.join(getDataPaths().storage, sanitizeName(driverName)));
+    const driverDir = localPath(path.join(getStoragePath(), sanitizeName(driverName)));
     const typeDir = localPath(path.join(driverDir, typeFolderName(loadType)));
     const folders: StorageLoadFolder[] = [];
     for (const parent of [typeDir, driverDir]) {
@@ -218,9 +250,9 @@ export class LocalStorage implements StorageProvider {
   }
 
   async renameDriverFolder(oldName: string, newName: string): Promise<StorageMove | null> {
-    const oldDir = localPath(path.join(getDataPaths().storage, sanitizeName(oldName)));
+    const oldDir = localPath(path.join(getStoragePath(), sanitizeName(oldName)));
     if (!fs.existsSync(oldDir)) return null;
-    return this.moveFolder(oldDir, path.join(getDataPaths().storage, sanitizeName(newName)));
+    return this.moveFolder(oldDir, path.join(getStoragePath(), sanitizeName(newName)));
   }
 
   async moveLoadFolder(folderRef: string, driverName: string, loadNumber: string, loadType: LoadType, archived: boolean) {
@@ -229,10 +261,10 @@ export class LocalStorage implements StorageProvider {
         throw new RequestError("An active or archived destination folder already exists; no documents were moved", 409);
       }
     }
-    const driverDir = localPath(path.join(getDataPaths().storage, sanitizeName(driverName)));
+    const driverDir = localPath(path.join(getStoragePath(), sanitizeName(driverName)));
     const destination = sameStorageRef(path.dirname(folderRef), driverDir)
       ? path.join(driverDir, loadFolderName(loadNumber, loadType, archived))
-      : this.folderPath(driverName, loadNumber, loadType, archived);
+      : path.join(this.loadParent(driverName, loadType), loadFolderName(loadNumber, loadType, archived));
     return this.moveFolder(folderRef, destination);
   }
 
@@ -296,6 +328,7 @@ const escapeQuery = (value: string) => value.replace(/\\/g, "\\\\").replace(/'/g
 
 export class DriveStorage implements StorageProvider {
   readonly mode = "drive" as const;
+  get readOnly() { return getDriveReadOnly(); }
   private drivePromise: Promise<drive_v3.Drive> | null = null;
 
   private drive(): Promise<drive_v3.Drive> {
@@ -304,9 +337,12 @@ export class DriveStorage implements StorageProvider {
         const { google } = await import("googleapis");
         const { GOOGLE_OAUTH_CLIENT_ID: clientId, GOOGLE_OAUTH_CLIENT_SECRET: clientSecret, GOOGLE_OAUTH_REFRESH_TOKEN: refreshToken } = process.env;
         if (clientId && clientSecret && refreshToken) {
-          const auth = new google.auth.OAuth2(clientId, clientSecret);
+          const auth = new google.auth.OAuth2({
+            clientId, clientSecret,
+            transporterOptions: { timeout: 20_000, retryConfig: { retry: 0 } },
+          });
           auth.setCredentials({ refresh_token: refreshToken });
-          return google.drive({ version: "v3", auth });
+          return google.drive({ version: "v3", auth, timeout: 20_000, retry: false });
         }
         let credentials: { client_email: string; private_key: string } | undefined;
         if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY_JSON) {
@@ -324,17 +360,18 @@ export class DriveStorage implements StorageProvider {
           credentials = { client_email: key.client_email, private_key: key.private_key };
         }
         const auth = new google.auth.GoogleAuth({
-          scopes: ["https://www.googleapis.com/auth/drive"],
+          scopes: [this.readOnly ? "https://www.googleapis.com/auth/drive.readonly" : "https://www.googleapis.com/auth/drive"],
+          clientOptions: { transporterOptions: { timeout: 20_000, retryConfig: { retry: 0 } } },
           ...(credentials ? { credentials } : { keyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE }),
         });
-        return google.drive({ version: "v3", auth });
+        return google.drive({ version: "v3", auth, timeout: 20_000, retry: false });
       })();
     }
     return this.drivePromise;
   }
 
   private rootFolderId() {
-    const id = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID;
+    const id = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID?.trim();
     if (!id) throw new Error("GOOGLE_DRIVE_ROOT_FOLDER_ID is not set");
     return id;
   }
@@ -350,6 +387,7 @@ export class DriveStorage implements StorageProvider {
   }
 
   private async createFolder(drive: drive_v3.Drive, name: string, parentId: string) {
+    assertStorageWritable(this);
     const response = await drive.files.create({
       requestBody: { name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] },
       fields: "id", supportsAllDrives: true,
@@ -397,6 +435,15 @@ export class DriveStorage implements StorageProvider {
     return folder || (create ? this.createFolder(drive, typeFolderName(loadType), driver) : null);
   }
 
+  private async loadParent(driverName: string, loadType: LoadType): Promise<string> {
+    const typed = await this.typeFolder(driverName, loadType, false);
+    if (typed) return typed;
+    const driver = requiredId(await this.driverFolder(driverName, true));
+    const children = await this.listEntries(driver, true);
+    if (children.some((entry) => isLoadFolderName(entry.filename))) return driver;
+    return requiredId(await this.typeFolder(driverName, loadType, true));
+  }
+
   async loadFolderExists(driverName: string, loadNumber: string, loadType: LoadType) {
     const drive = await this.drive();
     const driver = await this.driverFolder(driverName, false);
@@ -411,14 +458,16 @@ export class DriveStorage implements StorageProvider {
   }
 
   async createLoadFolder(driverName: string, loadNumber: string, loadType: LoadType) {
+    assertStorageWritable(this);
     if (await this.loadFolderExists(driverName, loadNumber, loadType)) {
       throw new RequestError("An active or archived folder for this load already exists", 409);
     }
-    const parent = requiredId(await this.typeFolder(driverName, loadType, true));
+    const parent = await this.loadParent(driverName, loadType);
     return this.createFolder(await this.drive(), loadFolderName(loadNumber, loadType), parent);
   }
 
   async removeEmptyLoadFolder(folderRef: string) {
+    assertStorageWritable(this);
     const drive = await this.drive();
     const response = await drive.files.list({
       q: `'${escapeQuery(folderRef)}' in parents and trashed = false`,
@@ -446,7 +495,11 @@ export class DriveStorage implements StorageProvider {
     const drive = await this.drive();
     const entries: StorageFileEntry[] = [];
     let pageToken: string | undefined;
+    const deadline = Date.now() + 45_000;
     do {
+      if (Date.now() >= deadline) {
+        throw new RequestError("Google Drive listing exceeded the time limit. No partial folder listing was used; retry Sync storage.", 503);
+      }
       const response = await drive.files.list({
         q: `'${escapeQuery(parent)}' in parents and mimeType ${folders ? "=" : "!="} 'application/vnd.google-apps.folder' and trashed = false`,
         fields: "nextPageToken, files(id, name, size, webViewLink, createdTime)",
@@ -469,6 +522,7 @@ export class DriveStorage implements StorageProvider {
   }
 
   private async moveFolder(folderRef: string, name: string, parent: string, preserveParent?: string): Promise<StorageMove> {
+    assertStorageWritable(this);
     const drive = await this.drive();
     const original = await drive.files.get({ fileId: folderRef, fields: "name, parents, mimeType", supportsAllDrives: true });
     if (original.data.mimeType !== "application/vnd.google-apps.folder" || !original.data.name || original.data.parents?.length !== 1) {
@@ -498,13 +552,15 @@ export class DriveStorage implements StorageProvider {
   }
 
   async renameDriverFolder(oldName: string, newName: string): Promise<StorageMove | null> {
+    assertStorageWritable(this);
     const folder = await this.findFolder(await this.drive(), sanitizeName(oldName), this.rootFolderId());
     return folder ? this.moveFolder(folder, sanitizeName(newName), this.rootFolderId()) : null;
   }
 
   async moveLoadFolder(folderRef: string, driverName: string, loadNumber: string, loadType: LoadType, archived: boolean) {
+    assertStorageWritable(this);
     const driver = requiredId(await this.driverFolder(driverName, true));
-    const parent = requiredId(await this.typeFolder(driverName, loadType, true));
+    const parent = await this.loadParent(driverName, loadType);
     const drive = await this.drive();
     for (const location of Array.from(new Set([parent, driver]))) {
       for (const state of [false, true]) {
@@ -518,6 +574,7 @@ export class DriveStorage implements StorageProvider {
   }
 
   async saveFile(folderRef: string, filename: string, data: Buffer, mimeType: string): Promise<SavedFile> {
+    assertStorageWritable(this);
     const safeName = sanitizeName(filename);
     const response = await (await this.drive()).files.create({
       requestBody: { name: safeName, parents: [folderRef] },
@@ -527,6 +584,7 @@ export class DriveStorage implements StorageProvider {
   }
 
   async deleteFile(storageRef: string) {
+    assertStorageWritable(this);
     try {
       await (await this.drive()).files.delete({ fileId: storageRef, supportsAllDrives: true });
     } catch (error) {

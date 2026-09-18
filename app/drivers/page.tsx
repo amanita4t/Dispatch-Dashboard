@@ -8,8 +8,10 @@ import type { DriverRecord, DriverSummary } from "@/lib/models";
 import { useActionLock } from "@/lib/use-action-lock";
 import { useDriverRoster } from "@/lib/use-driver-roster";
 import { IconPlus, IconTrash, IconTruck, IconUsers } from "@/components/icons";
+import { useStorageStatus } from "@/components/StorageStatusProvider";
 
 export default function DriversPage() {
+  const { canWrite } = useStorageStatus();
   const { drivers, loading, error: rosterError, refresh } = useDriverRoster();
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -24,6 +26,7 @@ export default function DriversPage() {
 
   async function addDriver(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!canWrite) return;
     if (!name.trim()) {
       setError("Name is required.");
       return;
@@ -81,7 +84,7 @@ export default function DriversPage() {
   }
 
   async function deleteDriver(d: DriverSummary) {
-    if (busy) return;
+    if (!canWrite || busy) return;
     setDeleteError("");
     if (d.load_count > 0) {
       setDeleteError(`${d.name} has ${d.load_count} assigned load(s), including archived loads. Reassign them first; archived loads must be restored before reassignment. Archiving does not remove a driver's assignments.`);
@@ -111,7 +114,7 @@ export default function DriversPage() {
       </div>
 
       {/* Add driver */}
-      <div className="mb-5 overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm">
+      {canWrite && <div className="mb-5 overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm">
         <div className="border-b border-slate-200/80 bg-slate-50/60 px-5 py-3">
           <h2 className="text-[13px] font-semibold text-slate-800">Add Driver</h2>
         </div>
@@ -166,7 +169,7 @@ export default function DriversPage() {
           </button>
           {error && <div role="alert" className="w-full text-[12.5px] text-red-600">{error}</div>}
         </form>
-      </div>
+      </div>}
 
       {/* Roster */}
       <div className="overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm">
@@ -189,7 +192,7 @@ export default function DriversPage() {
           <div className="px-5 py-12 text-center">
             <IconUsers className="mx-auto mb-2 h-6 w-6 text-slate-300" />
             <div className="text-[13px] text-slate-400">
-              No drivers yet. Add your first driver above.
+              {canWrite ? "No drivers yet. Add your first driver above." : "No drivers yet. Use Sync Storage on the load board to import existing driver folders."}
             </div>
           </div>
         ) : (
@@ -207,7 +210,7 @@ export default function DriversPage() {
                         id={`edit-driver-name-${d.id}`}
                         value={edit.name}
                         required
-                        disabled={busy}
+                        disabled={busy || !canWrite}
                         onChange={(e) => setEdit({ ...edit, name: e.target.value })}
                         className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                       />
@@ -285,7 +288,7 @@ export default function DriversPage() {
                     </button>
                     <button
                       onClick={() => deleteDriver(d)}
-                      disabled={busy}
+                      disabled={busy || !canWrite}
                       title="Remove driver"
                       aria-label={`Remove driver ${d.name}`}
                       className="rounded-md p-1.5 text-slate-400 transition-all hover:bg-red-50 hover:text-red-600 focus:opacity-100 disabled:opacity-40 sm:opacity-0 sm:group-hover:opacity-100"

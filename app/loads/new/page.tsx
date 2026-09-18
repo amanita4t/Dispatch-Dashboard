@@ -8,9 +8,11 @@ import { sanitizeBoardReturnUrl, withBoardReturn } from "@/lib/board-navigation"
 import { requestJson } from "@/lib/client-api";
 import { errorMessage } from "@/lib/errors";
 import type { LoadRecord } from "@/lib/models";
+import { uploadLimitError } from "@/lib/upload-limits";
 import { useActionLock } from "@/lib/use-action-lock";
 import { useDriverRoster } from "@/lib/use-driver-roster";
 import { IconArrowLeft, IconFile, IconUpload } from "@/components/icons";
+import { useStorageStatus } from "@/components/StorageStatusProvider";
 
 const inputCls =
   "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-[13px] shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20";
@@ -52,6 +54,7 @@ function FilePicker({
           type="file"
           name={name}
           required={required}
+          aria-describedby="booking-upload-limit"
           className="sr-only"
           onChange={(e) => setFileName(e.target.files?.[0]?.name ?? "")}
         />
@@ -86,6 +89,7 @@ export default function NewLoadPage() {
 }
 
 function NewLoadForm() {
+  const { status, error: storageError, canWrite } = useStorageStatus();
   const router = useRouter();
   const searchParams = useSearchParams();
   const returnTo = sanitizeBoardReturnUrl(searchParams.get("returnTo"));
@@ -99,10 +103,16 @@ function NewLoadForm() {
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!canWrite) return;
     if (hasCreatedLoad.current || driversLoading || driverError || drivers.length === 0 || !begin("booking")) return;
     setError("");
     try {
       const form = new FormData(e.currentTarget);
+      const limitError = uploadLimitError(form);
+      if (limitError) {
+        setError(limitError);
+        return;
+      }
       const data = await requestJson<{ load: LoadRecord; uploadErrors?: string[] }>("/api/loads", { method: "POST", body: form });
       hasCreatedLoad.current = true;
       setCreated({ load: data.load, uploadErrors: data.uploadErrors || [] });
@@ -112,6 +122,20 @@ function NewLoadForm() {
     } finally {
       finish();
     }
+  }
+
+  if (!canWrite) {
+    return (
+      <div className="mx-auto max-w-[720px]">
+        <Link href={returnTo} className="text-[13px] font-medium text-blue-700">Load Board</Link>
+        <h1 className="mt-4 text-[22px] font-semibold">Booking unavailable</h1>
+        <p role={storageError ? "alert" : "status"} className="mt-2 text-[13px] text-slate-600">
+          {storageError || (status?.readOnly
+            ? "Google Drive is read-only. Use Sync Storage to import existing loads; booking would create a folder and upload documents."
+            : "Checking storage access...")}
+        </p>
+      </div>
+    );
   }
 
   return (
@@ -127,7 +151,7 @@ function NewLoadForm() {
       <div className="mb-6">
         <h1 className="text-[22px] font-semibold tracking-tight text-slate-900">Book a Load</h1>
         <p className="mt-0.5 text-[13px] text-slate-500">
-          A folder is created automatically in the driver&apos;s Loads or Loadout directory.
+          The new folder follows the driver&apos;s existing storage layout. Existing folders and documents stay in place.
         </p>
       </div>
 
@@ -279,6 +303,10 @@ function NewLoadForm() {
             <h2 className="text-[13px] font-semibold text-slate-800">Paperwork</h2>
             <p className="mt-0.5 text-[12px] text-slate-500">
               Rate confirmation is required to book. More documents can be added later.
+            </p>
+            <p id="booking-upload-limit" className="mt-1 text-[12px] text-slate-600">
+              Limit: 4 MB total (4,000,000 bytes) for all selected document files combined in this request, not per file.
+              Add larger documents directly in Google Drive, then Sync storage.
             </p>
           </div>
           <div className="space-y-4 p-5">

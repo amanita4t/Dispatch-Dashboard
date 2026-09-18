@@ -1,7 +1,10 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    serverComponentsExternalPackages: ["better-sqlite3", "googleapis"],
+    serverComponentsExternalPackages: ["pg", "googleapis"],
+    outputFileTracingExcludes: {
+      "*": ["./data/**/*", "./storage/**/*", "./backups/**/*", "./tests/**/*", "./scripts/**/*", "./migrations/**/*", "./.env*"],
+    },
   },
 };
 

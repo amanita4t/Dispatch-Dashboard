@@ -14,7 +14,7 @@ export function positiveId(value: unknown, label = "ID"): number {
     throw new RequestError(`Invalid ${label}`);
   }
   const id = Number(value);
-  if (!Number.isSafeInteger(id) || id <= 0) throw new RequestError(`Invalid ${label}`);
+  if (!Number.isSafeInteger(id) || id <= 0 || id > 2_147_483_647) throw new RequestError(`Invalid ${label}`);
   return id;
 }
 

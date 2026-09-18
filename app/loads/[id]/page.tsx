@@ -14,6 +14,7 @@ import { useActionLock } from "@/lib/use-action-lock";
 import { useDriverRoster } from "@/lib/use-driver-roster";
 import { useLocalToday } from "@/lib/use-local-today";
 import { IconArrowLeft, IconFile, IconFolder, IconTrash, IconUpload } from "@/components/icons";
+import { useStorageStatus } from "@/components/StorageStatusProvider";
 
 function fmtSize(n: number) {
   if (n > 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
@@ -36,6 +37,7 @@ function LoadDetailRoute() {
 }
 
 function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
+  const { canWrite } = useStorageStatus();
   const loadUrl = `/api/loads/${encodeURIComponent(id)}`;
   const [load, setLoad] = useState<LoadDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -189,7 +191,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
 
   async function uploadFiles(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (files.length === 0 || archived || !begin("upload")) return;
+    if (!canWrite || files.length === 0 || archived || !begin("upload")) return;
     setUploadError("");
     try {
       const result = await uploadSelectedFiles(id, category, files);
@@ -207,7 +209,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
   }
 
   async function deleteFile(file: FileRecord) {
-    if (archived || busy || !confirm(`Delete "${file.filename}"? This removes the document from storage and this load.`)) return;
+    if (!canWrite || archived || busy || !confirm(`Delete "${file.filename}"? This removes the document from storage and this load.`)) return;
     if (!begin(`delete:${file.id}`)) return;
     setUploadError("");
     try {
@@ -221,7 +223,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
   }
 
   async function toggleArchive() {
-    if (!load || busy) return;
+    if (!canWrite || !load || busy) return;
     if (!archived && (editing || notes !== load.notes || files.length > 0)) {
       setActionError("Before archiving, save or cancel detail edits, save or discard unsaved notes, and upload or clear selected files.");
       return;
@@ -302,7 +304,8 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
         </div>
         <button
           onClick={toggleArchive}
-          disabled={busy}
+          disabled={busy || !canWrite}
+          title={!canWrite ? "Archiving and restoring rename folders and are disabled while Drive is read-only" : undefined}
           className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-slate-600 shadow-sm transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50"
         >
           <IconFolder className="h-3.5 w-3.5" />
@@ -469,7 +472,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
                 id="edit-driver"
                 value={edit.driver_id}
                 required
-                disabled={driversLoading || Boolean(driverError)}
+                disabled={!canWrite || driversLoading || Boolean(driverError)}
                 onChange={(e) => setEdit({ ...edit, driver_id: e.target.value })}
                 className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-60"
               >
@@ -603,7 +606,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
                     <span className="tnum">{f.uploaded_at}</span>
                   </div>
                 </div>
-                {!archived && (
+                {!archived && canWrite && (
                   <button
                     onClick={() => deleteFile(f)}
                     disabled={busy}
@@ -619,7 +622,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
           </ul>
         )}
 
-        {!archived ? (
+        {!archived && canWrite ? (
         <form
           onSubmit={uploadFiles}
           className="border-t border-slate-200/80 bg-slate-50/50 px-5 py-3.5"
@@ -644,6 +647,7 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
                 id="file-input"
                 type="file"
                 multiple
+                aria-describedby="document-upload-limit"
                 onChange={(e) => {
                   setFiles(Array.from(e.target.files ?? []));
                   setUploadError("");
@@ -683,6 +687,10 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
               </button>
             )}
           </div>
+          <p id="document-upload-limit" className="mt-2 text-[12px] text-slate-600">
+            Files upload one at a time. Each request allows 4 MB total (4,000,000 bytes) of document files.
+            Add larger documents directly in Google Drive, then Sync storage. Successful files are not retried.
+          </p>
           {files.length > 0 && (
             <ul className="mt-2 flex flex-wrap gap-1.5">
               {files.map((f, i) => (
@@ -710,7 +718,9 @@ function LoadDetailView({ id, returnTo }: { id: string; returnTo: string }) {
           </fieldset>
         </form>
         ) : (
-          <p className="border-t border-slate-200/80 bg-slate-50/50 px-5 py-3.5 text-[12.5px] text-slate-500">Restore this load to upload or delete documents.</p>
+          <p className="border-t border-slate-200/80 bg-slate-50/50 px-5 py-3.5 text-[12.5px] text-slate-500">
+            {!canWrite ? "Document changes are disabled. Existing documents can still be opened." : "Restore this load to upload or delete documents."}
+          </p>
         )}
         {uploadError && <div role="alert" className="px-5 py-3 text-[12.5px] text-red-600">{uploadError}</div>}
       </div>

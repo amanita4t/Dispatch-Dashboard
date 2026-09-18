@@ -1,47 +1,67 @@
 require("./register.cjs");
 const assert = require("node:assert/strict");
-const { test, after, afterEach } = require("node:test");
+const { test, before, after, afterEach } = require("node:test");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
-const Database = require("better-sqlite3");
+const { spawnSync } = require("node:child_process");
+const { startTestDatabase } = require("./postgres-helper.cjs");
 
 const originalCwd = process.cwd();
-const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-regression-"));
-process.chdir(workspace);
-process.env.STORAGE_MODE = "local";
-fs.mkdirSync("data");
-fs.writeFileSync(path.join("data", "dispatch.db"), "preserved-drive-database");
-const old = new Database(path.join("data", "dispatch-local.db"));
-old.exec(`
-  CREATE TABLE drivers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, phone TEXT DEFAULT '', truck TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')));
-  CREATE TABLE loads (id INTEGER PRIMARY KEY AUTOINCREMENT, load_number TEXT NOT NULL, load_type TEXT NOT NULL DEFAULT 'load', driver_id INTEGER NOT NULL REFERENCES drivers(id), pickup_city TEXT NOT NULL, delivery_city TEXT NOT NULL, pickup_date TEXT NOT NULL, delivery_date TEXT NOT NULL, rate_amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', folder_ref TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(load_number,load_type));
-  INSERT INTO drivers(name) VALUES ('Existing Driver');
-  INSERT INTO loads(load_number,driver_id,pickup_city,delivery_city,pickup_date,delivery_date,rate_amount) VALUES('EXISTING',1,'A','B','2026-09-01','2026-09-02',1250);
-`);
-old.close();
+const environment = new Map([
+  "DATABASE_URL", "POSTGRES_URL", "STORAGE_MODE", "VERCEL", "GOOGLE_DRIVE_ROOT_FOLDER_ID",
+  "GOOGLE_DRIVE_READ_ONLY", "GOOGLE_OAUTH_CLIENT_ID",
+  "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REFRESH_TOKEN",
+].map((key) => [key, process.env[key]]));
+let workspace;
+let postgres;
+let db;
+let DriveStorage, getStorage, loadFolderName, sanitizeName, withDataLock, todayLocal, overdueLabel;
+let routes;
 
-const db = require("../lib/db.ts").default;
-const { getStorage, loadFolderName, sanitizeName } = require("../lib/storage.ts");
-const { withDataLock } = require("../lib/mutation-lock.ts");
-const { todayLocal, overdueLabel } = require("../lib/dates.ts");
-const routes = {
-  drivers: require("../app/api/drivers/route.ts"),
-  driver: require("../app/api/drivers/[id]/route.ts"),
-  loads: require("../app/api/loads/route.ts"),
-  load: require("../app/api/loads/[id]/route.ts"),
-  archive: require("../app/api/loads/[id]/archive/route.ts"),
-  upload: require("../app/api/loads/[id]/files/route.ts"),
-  file: require("../app/api/files/[id]/route.ts"),
-  sync: require("../app/api/sync/route.ts"),
-};
+before(async () => {
+  workspace = path.resolve(fs.mkdtempSync(".dispatch-workflows-"));
+  process.chdir(workspace);
+  for (const key of environment.keys()) delete process.env[key];
+  process.env.STORAGE_MODE = "local";
+  fs.mkdirSync("data");
+  fs.writeFileSync(path.join("data", "private-fixture.txt"), "untouched local data");
+  postgres = await startTestDatabase({ storageRoot: path.join(workspace, "storage") });
+  process.env.DATABASE_URL = postgres.url;
+  db = require("../lib/db.ts").default;
+  ({ DriveStorage, getStorage, loadFolderName, sanitizeName } = require("../lib/storage.ts"));
+  ({ withDataLock } = require("../lib/mutation-lock.ts"));
+  ({ todayLocal, overdueLabel } = require("../lib/dates.ts"));
+  routes = {
+    drivers: require("../app/api/drivers/route.ts"),
+    driver: require("../app/api/drivers/[id]/route.ts"),
+    loads: require("../app/api/loads/route.ts"),
+    load: require("../app/api/loads/[id]/route.ts"),
+    archive: require("../app/api/loads/[id]/archive/route.ts"),
+    upload: require("../app/api/loads/[id]/files/route.ts"),
+    file: require("../app/api/files/[id]/route.ts"),
+    sync: require("../app/api/sync/route.ts"),
+  };
+  await db.query("SELECT 1");
+});
 
-async function call(route, method, { id = 1, body, query = "" } = {}) {
-  const options = { method };
+async function call(route, method, { id = 1, body, query = "", drainSync = true, headers = {} } = {}) {
+  const result = await callOnce(route, method, { id, body, query, headers });
+  if (route !== "sync" || method !== "POST" || !drainSync) return result;
+  let current = result;
+  for (let batch = 0; current.status === 200 && current.data.cursor !== null; batch++) {
+    assert.equal(typeof current.data.cursor, "string", "Sync must return a continuation cursor or null");
+    assert.ok(batch < 100, "Sync did not finish after 100 batches");
+    current = await callOnce(route, method, { body: { cursor: current.data.cursor } });
+  }
+  return current;
+}
+
+async function callOnce(route, method, { id = 1, body, query = "", headers = {} } = {}) {
+  const options = { method, headers };
   if (body instanceof FormData) options.body = body;
   else if (body !== undefined) {
     options.body = JSON.stringify(body);
-    options.headers = { "Content-Type": "application/json" };
+    options.headers = { ...headers, "Content-Type": "application/json" };
   }
   const response = await routes[route][method](new Request("http://localhost/api?" + query, options), { params: { id: String(id) } });
   const content = await response.text();
@@ -49,6 +69,95 @@ async function call(route, method, { id = 1, body, query = "" } = {}) {
     status: response.status,
     data: response.headers.get("content-type")?.includes("application/json") ? JSON.parse(content) : content,
   };
+}
+
+async function rejectLoadChanges(event, message, deferred = false) {
+  assert.ok(["INSERT", "UPDATE"].includes(event));
+  const name = event === "INSERT" ? "reject_load" : "reject_edit";
+  await db.query(`
+    CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION '%', '${message.replaceAll("'", "''")}';
+      END;
+    $$;
+    CREATE ${deferred ? "CONSTRAINT " : ""}TRIGGER ${name}
+      ${deferred ? "AFTER" : "BEFORE"} ${event} ON loads
+      ${deferred ? "DEFERRABLE INITIALLY DEFERRED" : ""}
+      FOR EACH ROW EXECUTE FUNCTION ${name}();
+  `);
+}
+
+async function rejectFileInsert({ optional = false, deferred = false } = {}) {
+  await db.query(`
+    CREATE FUNCTION reject_file() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF ${optional ? "NEW.category = 'bol'" : "TRUE"} THEN
+          RAISE EXCEPTION 'forced file metadata failure';
+        END IF;
+        RETURN NEW;
+      END;
+    $$;
+    CREATE ${deferred ? "CONSTRAINT " : ""}TRIGGER reject_file
+      ${deferred ? "AFTER" : "BEFORE"} INSERT ON files
+      ${deferred ? "DEFERRABLE INITIALLY DEFERRED" : ""}
+      FOR EACH ROW EXECUTE FUNCTION reject_file();
+  `);
+}
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function promptly(promise) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Operation waited for an unrelated mutation")), 5000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function finishHeldMutation(mutation, release, pending) {
+  release.resolve();
+  const [result] = await Promise.allSettled([mutation, ...pending]);
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
+function callFromFreshProcess(route, method, { id = 1, body } = {}) {
+  const child = spawnSync(process.execPath, [
+    "-e",
+    `
+      require(process.argv[1]);
+      const db = require(process.argv[2]).default;
+      (async () => {
+        try {
+          const route = require(process.argv[3]);
+          const { method, id, body } = JSON.parse(process.argv[4]);
+          const response = await route[method](new Request("http://localhost/api", {
+            method, headers: { "Content-Type": "application/json" },
+            body: body === undefined ? undefined : JSON.stringify(body),
+          }), { params: { id: String(id) } });
+          console.log(JSON.stringify({ status: response.status, data: await response.json() }));
+        } finally { await db.close(); }
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `,
+    path.join(__dirname, "register.cjs"),
+    path.join(__dirname, "..", "lib", "db.ts"),
+    route,
+    JSON.stringify({ method, id, body }),
+  ], { cwd: workspace, env: process.env, encoding: "utf8", timeout: 30_000, windowsHide: true });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  return JSON.parse(child.stdout.trim());
 }
 
 async function driver(name = "Test Driver") {
@@ -83,29 +192,71 @@ function manualLoad(driverName, folders) {
   return { folder, file };
 }
 
-afterEach(() => {
-  db.exec("DROP TRIGGER IF EXISTS reject_load; DROP TRIGGER IF EXISTS reject_edit; DELETE FROM files; DELETE FROM loads; DELETE FROM drivers");
+afterEach(async () => {
+  if (!db) return;
+  await db.query(`
+    DROP TRIGGER IF EXISTS reject_load ON loads;
+    DROP TRIGGER IF EXISTS reject_edit ON loads;
+    DROP TRIGGER IF EXISTS reject_file ON files;
+    DROP FUNCTION IF EXISTS reject_load();
+    DROP FUNCTION IF EXISTS reject_edit();
+    DROP FUNCTION IF EXISTS reject_file();
+    DELETE FROM sync_runs;
+    DELETE FROM files;
+    DELETE FROM loads;
+    DELETE FROM drivers;
+  `);
   const storage = path.join(workspace, "storage");
   if (fs.existsSync(storage)) {
     for (const entry of fs.readdirSync(storage)) fs.rmSync(path.join(storage, entry), { recursive: true });
   }
-  assert.equal(fs.readFileSync(path.join(workspace, "data", "dispatch.db"), "utf8"), "preserved-drive-database");
+  assert.equal(fs.readFileSync(path.join(workspace, "data", "private-fixture.txt"), "utf8"), "untouched local data");
 });
 
-after(() => {
-  db.close();
-  process.chdir(originalCwd);
-  assert.equal(path.dirname(workspace), os.tmpdir());
-  assert.ok(path.basename(workspace).startsWith("dispatch-regression-"));
-  fs.rmSync(workspace, { recursive: true });
+after(async () => {
+  try {
+    if (db) await db.close();
+  } finally {
+    process.chdir(originalCwd);
+    try {
+      if (postgres) await postgres.close();
+    } finally {
+      for (const [key, value] of environment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (workspace) {
+        assert.equal(path.dirname(workspace), originalCwd);
+        assert.ok(path.basename(workspace).startsWith(".dispatch-workflows-"));
+        fs.rmSync(workspace, { recursive: true, force: true });
+      }
+    }
+  }
 });
 
-test("additive migrations preserve existing records and add archive/due-date fields", () => {
-  const row = db.prepare("SELECT * FROM loads").get();
-  assert.equal(row.load_number, "EXISTING");
-  assert.equal(row.rate_amount, 1250);
+test("PostgreSQL preserves numeric identifiers and amounts, text dates, and nullable archive fields", async () => {
+  assert.match((await db.one("SELECT version() AS version")).version, /^PostgreSQL /);
+  const item = await load(await driver(), "SCHEMA");
+  const row = await db.one("SELECT * FROM loads WHERE id = $1", [item.id]);
+  assert.equal(row.id, item.id);
+  assert.equal(typeof row.id, "number");
+  assert.equal(typeof row.driver_id, "number");
+  assert.equal(row.load_number, "SCHEMA");
+  assert.equal(row.rate_amount, 1200);
+  assert.equal(typeof row.rate_amount, "number");
+  assert.equal(row.pickup_date, "2026-09-01");
+  assert.equal(typeof row.created_at, "string");
   assert.equal(row.archived_at, null);
   assert.equal(row.invoice_due_date, "");
+  assert.equal(typeof item.files[0].id, "number");
+  assert.equal(typeof item.files[0].storage_ref, "string");
+});
+
+test("load identifiers respect the PostgreSQL integer boundary before querying", async () => {
+  for (const id of [2_147_483_648, Number.MAX_SAFE_INTEGER]) {
+    assert.equal((await call("load", "GET", { id })).status, 400, String(id));
+  }
+  assert.equal((await call("load", "GET", { id: 2_147_483_647 })).status, 404);
 });
 
 test("booking saves required paperwork before committing the complete load", async () => {
@@ -124,18 +275,30 @@ test("required upload failure removes the new load folder and leaves no record",
   const result = await call("loads", "POST", { body: form(id) });
   assert.equal(result.status, 500);
   assert.match(result.data.error, /Required upload failed/);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM loads").get().n, 0);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM files").get().n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 0);
   assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #100")), false);
 });
 
 test("database failure after uploading rolls back files and the load folder", async (t) => {
   t.mock.method(console, "error", () => {});
   const id = await driver();
-  db.exec("CREATE TRIGGER reject_load BEFORE INSERT ON loads BEGIN SELECT RAISE(ABORT,'forced database failure'); END");
+  await rejectLoadChanges("INSERT", "forced database failure");
   const result = await call("loads", "POST", { body: form(id) });
   assert.equal(result.status, 500);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM files").get().n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 0);
+  assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #100")), false);
+});
+
+test("PostgreSQL COMMIT failure compensates uploaded paperwork and the new load folder", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const id = await driver();
+  await rejectLoadChanges("INSERT", "forced commit failure", true);
+  const result = await call("loads", "POST", { body: form(id) });
+  assert.equal(result.status, 500);
+  assert.match(result.data.error, /forced commit failure/);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 0);
   assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #100")), false);
 });
 
@@ -152,7 +315,36 @@ test("optional upload failures are explicit and do not discard the required docu
   const result = await call("loads", "POST", { body });
   assert.equal(result.status, 201);
   assert.equal(result.data.uploadErrors.length, 1);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM files").get().n, 1);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 1);
+});
+
+test("optional document metadata failure atomically rolls back the booking and all uploaded paperwork", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const id = await driver();
+  await rejectFileInsert({ optional: true });
+  const body = form(id);
+  body.set("bol", new File(["BOL"], "bol.txt"));
+  const result = await call("loads", "POST", { body });
+  assert.equal(result.status, 500);
+  assert.match(result.data.error, /forced file metadata failure/);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 0);
+  assert.equal((await db.one("SELECT id FROM drivers")).id, id);
+  assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #100")), false);
+});
+
+test("document upload COMMIT failure removes only the new file and preserves existing paperwork", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const item = await load(await driver());
+  await rejectFileInsert({ deferred: true });
+  const body = new FormData();
+  body.set("file", new File(["new document"], "new.txt"));
+  const result = await call("upload", "POST", { id: item.id, body });
+  assert.equal(result.status, 500);
+  assert.match(result.data.error, /forced file metadata failure/);
+  assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+  assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
+  assert.equal(fs.existsSync(path.join(item.folder_ref, "new.txt")), false);
 });
 
 test("invalid booking fields and missing required files make no changes", async () => {
@@ -170,8 +362,72 @@ test("invalid booking fields and missing required files make no changes", async 
   body.delete("rate_confirmation");
   assert.equal((await call("loads", "POST", { body })).status, 400);
   assert.equal((await call("loads", "POST", { body: {} })).status, 400);
-  assert.equal((await call("upload", "POST", { body: {} })).status, 400);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM loads").get().n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+});
+
+test("booking enforces the 4000000-byte file total independently of UTF-8 fields", async () => {
+  const id = await driver();
+  const oversized = form(id, "OVERSIZED");
+  oversized.set("rate_confirmation", new File([Buffer.alloc(2_000_000)], "rate.pdf"));
+  oversized.set("bol", new File([Buffer.alloc(2_000_001)], "bol.pdf"));
+  const rejected = await call("loads", "POST", { body: oversized });
+  assert.equal(rejected.status, 413);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 0);
+  assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #OVERSIZED")), false);
+  const boundary = form(id, "BOUNDARY");
+  boundary.set("pickup_city", "Montréal 🚚");
+  boundary.set("rate_confirmation", new File([Buffer.alloc(4_000_000)], "rate.pdf"));
+  const accepted = await call("loads", "POST", { body: boundary });
+  assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
+  const detail = await call("load", "GET", { id: accepted.data.load.id });
+  assert.equal(fs.statSync(detail.data.files[0].storage_ref).size, 4_000_000);
+  assert.equal(detail.data.pickup_city, "Montréal 🚚");
+});
+
+test("document uploads accept the file-byte boundary and reject an extra byte without side effects", async () => {
+  const item = await load(await driver());
+  assert.equal((await call("upload", "POST", { id: item.id, body: {} })).status, 400);
+  const body = new FormData();
+  body.set("file", new File([Buffer.alloc(4_000_001)], "too-large.pdf"));
+  const rejected = await call("upload", "POST", { id: item.id, body });
+  assert.equal(rejected.status, 413);
+  assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+  assert.equal(fs.existsSync(path.join(item.folder_ref, "too-large.pdf")), false);
+  body.set("file", new File([Buffer.alloc(4_000_000)], "boundary.pdf"));
+  const accepted = await call("upload", "POST", { id: item.id, body });
+  assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
+  assert.equal(fs.statSync(path.join(item.folder_ref, "boundary.pdf")).size, 4_000_000);
+  body.set("category", "invoice");
+  const invoiceBytes = 4_000_000;
+  body.set("file", new File([Buffer.alloc(invoiceBytes + 1)], "invoice.pdf"));
+  assert.equal((await call("upload", "POST", { id: item.id, body })).status, 413);
+  assert.equal(fs.existsSync(path.join(item.folder_ref, "invoice.pdf")), false);
+  body.set("file", new File([Buffer.alloc(invoiceBytes)], "invoice.pdf"));
+  const invoice = await call("upload", "POST", { id: item.id, body });
+  assert.equal(invoice.status, 201, JSON.stringify(invoice.data));
+  assert.equal(fs.statSync(path.join(item.folder_ref, "invoice.pdf")).size, invoiceBytes);
+});
+
+test("encoded multipart requests above 4250000 bytes are rejected even without Content-Length", async () => {
+  const id = await driver();
+  const item = await load(id);
+  for (const declared of [false, true]) {
+    const booking = form(id, "ENCODED");
+    const document = new FormData();
+    document.set("file", new File(["small document"], "extra.txt"));
+    const headers = declared ? { "Content-Length": "4250001" } : {};
+    if (!declared) {
+      booking.set("notes", "x".repeat(4_250_001));
+      document.set("padding", "x".repeat(4_250_001));
+    }
+    assert.equal((await call("loads", "POST", { body: booking, headers })).status, 413, `booking, declared=${declared}`);
+    assert.equal((await call("upload", "POST", { id: item.id, body: document, headers })).status, 413, `upload, declared=${declared}`);
+    assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+    assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 1);
+    assert.equal(fs.existsSync(path.join(item.folder_ref, "extra.txt")), false);
+    assert.equal(fs.existsSync(path.join(path.dirname(item.folder_ref), "Load #ENCODED")), false);
+  }
 });
 
 test("edits validate all fields before changing any load details", async () => {
@@ -197,7 +453,43 @@ test("concurrent duplicate bookings create only one load and folder", async () =
     call("loads", "POST", { body: form(id) }),
   ]);
   assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM loads").get().n, 1);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 1);
+});
+
+test("booking locks normalized load numbers while unrelated bookings continue", async (t) => {
+  const id = await driver();
+  const independentId = await driver("Independent Driver");
+  const storage = getStorage();
+  const save = storage.saveFile.bind(storage);
+  const entered = deferred();
+  const release = deferred();
+  const pending = [];
+  t.mock.method(storage, "saveFile", async (folder, ...args) => {
+    if (path.basename(folder) === "Load #AB_CD") {
+      entered.resolve();
+      await release.promise;
+    }
+    return save(folder, ...args);
+  });
+  const booking = call("loads", "POST", { body: form(id, "AB/CD") });
+  booking.then((result) => {
+    if (result.status !== 201) entered.reject(new Error(JSON.stringify(result)));
+  }, entered.reject);
+  const run = (promise) => { pending.push(promise); return promptly(promise); };
+  try {
+    await promptly(entered.promise);
+    const conflicting = await run(call("loads", "POST", { body: form(independentId, "ab\\cd") }));
+    assert.equal(conflicting.status, 409);
+    const independent = await run(call("loads", "POST", { body: form(independentId, "OTHER") }));
+    assert.equal(independent.status, 201, JSON.stringify(independent.data));
+    const listed = await run(call("loads", "GET"));
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.data.map((item) => item.load_number), ["OTHER"]);
+  } finally {
+    assert.equal((await finishHeldMutation(booking, release, pending)).status, 201);
+  }
+  assert.deepEqual((await call("loads", "GET")).data.map((item) => item.load_number).sort(), ["AB/CD", "OTHER"]);
+  assert.equal(fs.readFileSync(path.join(workspace, "storage", "Test Driver", "Loads", "Load #AB_CD", "rate.txt"), "utf8"), "rate content");
 });
 
 test("archive and restore rename both load types and keep every document reachable", async () => {
@@ -231,11 +523,50 @@ test("folder conflicts block archive without overwriting or losing original reco
   assert.equal(fs.readFileSync(path.join(target, "keep.txt"), "utf8"), "keep");
 });
 
+test("local downloads report a busy load during folder moves rather than incorrectly reporting missing documents", async (t) => {
+  const item = await load(await driver());
+  const storage = getStorage();
+  const original = storage.moveLoadFolder;
+  const moved = deferred();
+  const release = deferred();
+  t.mock.method(storage, "moveLoadFolder", async (...args) => {
+    const result = await original.apply(storage, args);
+    moved.resolve();
+    await release.promise;
+    return result;
+  });
+  const archiving = call("archive", "POST", { id: item.id, body: { archived: true } });
+  let result;
+  try {
+    await promptly(moved.promise);
+    assert.equal((await promptly(call("file", "GET", { id: item.files[0].id }))).status, 409);
+    assert.equal((await promptly(call("loads", "GET"))).status, 200);
+  } finally {
+    result = await finishHeldMutation(archiving, release, []);
+  }
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  const downloaded = await call("file", "GET", { id: item.files[0].id });
+  assert.equal(downloaded.status, 200);
+  assert.equal(downloaded.data, "rate content");
+});
+
 test("database edit failure rolls back physical archive and document paths", async (t) => {
   t.mock.method(console, "error", () => {});
   const item = await load(await driver());
-  db.exec("CREATE TRIGGER reject_edit BEFORE UPDATE ON loads BEGIN SELECT RAISE(ABORT,'forced edit failure'); END");
+  await rejectLoadChanges("UPDATE", "forced edit failure");
   assert.equal((await call("archive", "POST", { id: item.id, body: { archived: true } })).status, 500);
+  assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+  assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
+  assert.equal(fs.existsSync(path.join(path.dirname(item.folder_ref), "Archived - Load #100")), false);
+});
+
+test("PostgreSQL COMMIT failure restores the original folder and file references after archiving", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const item = await load(await driver());
+  await rejectLoadChanges("UPDATE", "forced archive commit failure", true);
+  const result = await call("archive", "POST", { id: item.id, body: { archived: true } });
+  assert.equal(result.status, 500);
+  assert.match(result.data.error, /forced archive commit failure/);
   assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
   assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
   assert.equal(fs.existsSync(path.join(path.dirname(item.folder_ref), "Archived - Load #100")), false);
@@ -279,6 +610,23 @@ test("driver rename updates archived folders and refuses normalized-name collisi
   await driver("A/B");
   assert.equal((await call("drivers", "POST", { body: { name: "A\\B" } })).status, 409);
   for (const name of ["..", ".", "CON", "NUL.txt"]) assert.throws(() => sanitizeName(name));
+});
+
+test("deferred database deletion failures are checked before destroying a document", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const item = await load(await driver());
+  await db.query(`
+    CREATE FUNCTION reject_file() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced deferred document deletion failure'; END;
+    $$;
+    CREATE CONSTRAINT TRIGGER reject_file AFTER DELETE ON files
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_file();
+  `);
+  const failed = await call("file", "DELETE", { id: item.files[0].id });
+  assert.equal(failed.status, 500);
+  assert.match(failed.data.error, /forced deferred document deletion failure/);
+  assert.equal((await call("load", "GET", { id: item.id })).data.files.length, 1);
+  assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
 });
 
 test("failed physical deletion keeps metadata and archived files are read-only", async (t) => {
@@ -329,6 +677,44 @@ test("sync recognizes sanitized load folder names without duplicating the load",
   assert.equal((await call("loads", "GET")).data.length, 1);
 });
 
+test("sync persists cumulative batches that resume from a fresh server process", async () => {
+  const documents = [];
+  for (let index = 0; index < 16; index++) {
+    for (let number = 0; number < 3; number++) {
+      documents.push(manualLoad(`Batch Driver ${index}`, [`Load #BATCH-${index}-${number}`]));
+    }
+  }
+  const first = await call("sync", "POST", { drainSync: false });
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.equal(typeof first.data.cursor, "string");
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM sync_runs")).n, 1);
+  const resumed = callFromFreshProcess(path.join(__dirname, "..", "app", "api", "sync", "route.ts"), "POST", {
+    body: { cursor: first.data.cursor },
+  });
+  assert.equal(resumed.status, 200, JSON.stringify(resumed.data));
+  for (const key of ["driversScanned", "driversImported", "loadsImported", "filesImported"]) {
+    assert.ok(resumed.data[key] >= first.data[key], `${key} must be cumulative`);
+  }
+  const complete = resumed.data.cursor === null
+    ? resumed
+    : await call("sync", "POST", { body: { cursor: resumed.data.cursor } });
+  assert.equal(complete.status, 200, JSON.stringify(complete.data));
+  assert.deepEqual(complete.data, {
+    driversScanned: 16, driversImported: 16, loadsImported: 48, loadsArchived: 0, filesImported: 48,
+    skippedExisting: 0, skippedArchived: 0, errors: [], cursor: null,
+  });
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 48);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 48);
+  const retried = await call("sync", "POST", { body: { cursor: first.data.cursor }, drainSync: false });
+  assert.deepEqual(retried, complete, "Retrying a completed cursor must return its persisted final summary");
+  const repeated = await call("sync", "POST");
+  assert.equal(repeated.data.loadsImported, 0);
+  assert.equal(repeated.data.filesImported, 0);
+  assert.equal(repeated.data.skippedExisting, 48);
+  assert.deepEqual(repeated.data.errors, []);
+  for (const document of documents) assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
+});
+
 test("sync discovers drivers and both load layouts without moving documents or duplicating records", async () => {
   const documents = [
     { ...manualLoad("Williams", ["Load #999999"]), number: "999999", type: "load" },
@@ -347,16 +733,16 @@ test("sync discovers drivers and both load layouts without moving documents or d
   assert.equal(sync.status, 200);
   assert.deepEqual(sync.data, {
     driversScanned: 2, driversImported: 2, loadsImported: 4, loadsArchived: 0, filesImported: 4,
-    skippedExisting: 0, skippedArchived: 0, errors: [],
+    skippedExisting: 0, skippedArchived: 0, errors: [], cursor: null,
   });
-  const drivers = db.prepare("SELECT * FROM drivers ORDER BY id").all();
+  const drivers = await db.all("SELECT * FROM drivers ORDER BY id");
   assert.deepEqual(drivers.map((item) => item.name).sort(), ["New Driver", "Williams"]);
   for (const item of drivers) {
     assert.equal(item.phone, "");
     assert.equal(item.truck, "");
   }
   for (const document of documents) {
-    const item = db.prepare("SELECT * FROM loads WHERE load_number = ? AND load_type = ?").get(document.number, document.type);
+    const item = await db.one("SELECT * FROM loads WHERE load_number = $1 AND load_type = $2", [document.number, document.type]);
     assert.equal(item.folder_ref, document.folder);
     assert.equal(item.status, "scheduled");
     assert.equal(item.pickup_city, "");
@@ -367,16 +753,16 @@ test("sync discovers drivers and both load layouts without moving documents or d
     assert.equal(detail.files[0].category, "rate_confirmation");
     assert.equal((await call("file", "GET", { id: detail.files[0].id })).data, "manual rate content");
   }
-  const loads = db.prepare("SELECT * FROM loads ORDER BY id").all();
-  const files = db.prepare("SELECT * FROM files ORDER BY id").all();
+  const loads = await db.all("SELECT * FROM loads ORDER BY id");
+  const files = await db.all("SELECT * FROM files ORDER BY id");
   const repeated = await call("sync", "POST");
   assert.deepEqual(repeated.data, {
     driversScanned: 2, driversImported: 0, loadsImported: 0, loadsArchived: 0, filesImported: 0,
-    skippedExisting: 4, skippedArchived: 0, errors: [],
+    skippedExisting: 4, skippedArchived: 0, errors: [], cursor: null,
   });
-  assert.deepEqual(db.prepare("SELECT * FROM drivers ORDER BY id").all(), drivers);
-  assert.deepEqual(db.prepare("SELECT * FROM loads ORDER BY id").all(), loads);
-  assert.deepEqual(db.prepare("SELECT * FROM files ORDER BY id").all(), files);
+  assert.deepEqual(await db.all("SELECT * FROM drivers ORDER BY id"), drivers);
+  assert.deepEqual(await db.all("SELECT * FROM loads ORDER BY id"), loads);
+  assert.deepEqual(await db.all("SELECT * FROM files ORDER BY id"), files);
   for (const document of [...documents, ...ignored]) {
     assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
   }
@@ -389,7 +775,7 @@ test("sync discovers drivers and both load layouts without moving documents or d
   assert.equal(additional.data.loadsImported, 0);
   assert.equal(additional.data.filesImported, 1);
   assert.deepEqual(additional.data.errors, []);
-  assert.equal(db.prepare("SELECT category FROM files WHERE storage_ref = ?").get(bol).category, "bol");
+  assert.equal((await db.one("SELECT category FROM files WHERE storage_ref = $1", [bol])).category, "bol");
 });
 
 test("sync reuses the registered driver behind a sanitized folder name", async () => {
@@ -399,8 +785,8 @@ test("sync reuses the registered driver behind a sanitized folder name", async (
   assert.equal(result.data.driversImported, 0);
   assert.equal(result.data.loadsImported, 1);
   assert.deepEqual(result.data.errors, []);
-  assert.equal(db.prepare("SELECT driver_id FROM loads").get().driver_id, id);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM drivers").get().n, 1);
+  assert.equal((await db.one("SELECT driver_id FROM loads")).driver_id, id);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM drivers")).n, 1);
   assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
 });
 
@@ -422,8 +808,8 @@ test("sync reports ambiguous driver folder names without registering or scanning
   assert.equal(result.data.loadsImported, 1);
   assert.equal(result.data.errors.length, 2);
   assert.ok(result.data.errors.every((error) => /Multiple driver folders/.test(error)));
-  assert.deepEqual(db.prepare("SELECT name FROM drivers ORDER BY name").all(), [{ name: "Allowed" }, { name: "Existing" }]);
-  assert.deepEqual(db.prepare("SELECT load_number FROM loads").all(), [{ load_number: "200" }]);
+  assert.deepEqual(await db.all("SELECT name FROM drivers ORDER BY name"), [{ name: "Allowed" }, { name: "Existing" }]);
+  assert.deepEqual(await db.all("SELECT load_number FROM loads"), [{ load_number: "200" }]);
   assert.equal(fs.readFileSync(existing.file, "utf8"), "manual rate content");
 });
 
@@ -438,7 +824,7 @@ test("sync reports invalid driver folder names while importing valid folders", a
   assert.equal(result.data.driversImported, 1);
   assert.equal(result.data.loadsImported, 1);
   assert.equal(result.data.errors.length, 2);
-  assert.deepEqual(db.prepare("SELECT name FROM drivers").all(), [{ name: "Valid" }]);
+  assert.deepEqual(await db.all("SELECT name FROM drivers"), [{ name: "Valid" }]);
 });
 
 test("sync refuses duplicate load numbers across layouts instead of choosing or merging a folder", async () => {
@@ -454,7 +840,7 @@ test("sync refuses duplicate load numbers across layouts instead of choosing or 
   assert.equal(result.data.filesImported, 1);
   assert.equal(result.data.errors.length, 4);
   assert.ok(result.data.errors.every((error) => /multiple folders/.test(error)));
-  assert.deepEqual(db.prepare("SELECT load_number FROM loads").all(), [{ load_number: "200" }]);
+  assert.deepEqual(await db.all("SELECT load_number FROM loads"), [{ load_number: "200" }]);
   for (const document of documents) assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
 });
 
@@ -469,8 +855,123 @@ test("booking refuses direct active and archived folders before they have been s
     assert.equal(result.status, 409, JSON.stringify(result.data));
     assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
   }
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM loads").get().n, 0);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
   assert.equal(fs.existsSync(path.join(workspace, "storage", "Test Driver", "Loads")), false);
+});
+
+test("new loads and loadouts are siblings of existing direct load folders, including archived ones", async () => {
+  const seeds = ["Load #SEED-0", "Loadout #SEED-1", "Archived - Load #SEED-2", "Archived - Loadout #SEED-3"];
+  for (const [index, seed] of seeds.entries()) {
+    const name = `Flat Driver ${index}`;
+    const id = await driver(name);
+    const original = manualLoad(name, [seed]);
+    const parent = path.dirname(original.folder);
+    for (const type of ["load", "loadout"]) {
+      const item = await load(id, `NEW-${index}`, type);
+      assert.equal(item.folder_ref, path.join(parent, loadFolderName(`NEW-${index}`, type)));
+      assert.equal(item.files[0].storage_ref, path.join(item.folder_ref, "rate.txt"));
+      assert.equal((await call("file", "GET", { id: item.files[0].id })).data, "rate content");
+      assert.equal(fs.readFileSync(original.file, "utf8"), "manual rate content");
+    }
+    assert.deepEqual(fs.readdirSync(parent).sort(), [seed, `Load #NEW-${index}`, `Loadout #NEW-${index}`].sort());
+  }
+  const sync = await call("sync", "POST");
+  assert.deepEqual(sync.data.errors, []);
+  assert.equal(sync.data.skippedExisting, 8);
+  assert.equal(sync.data.loadsImported, 2);
+});
+
+test("an existing matching grouping folder wins while the other load type keeps the direct layout", async () => {
+  for (const [index, groupedType] of ["load", "loadout"].entries()) {
+    const name = `Mixed Driver ${index}`;
+    const id = await driver(name);
+    const original = manualLoad(name, [`Load #MANUAL-${index}`]);
+    const parent = path.dirname(original.folder);
+    const grouped = groupedType === "load" ? "Loads" : "Loadout";
+    fs.mkdirSync(path.join(parent, grouped));
+    for (const type of ["load", "loadout"]) {
+      const item = await load(id, `NEW-${index}`, type);
+      const expectedParent = type === groupedType ? path.join(parent, grouped) : parent;
+      assert.equal(item.folder_ref, path.join(expectedParent, loadFolderName(`NEW-${index}`, type)));
+    }
+    assert.equal(fs.existsSync(path.join(parent, groupedType === "load" ? "Loadout" : "Loads")), false);
+    assert.equal(fs.readFileSync(original.file, "utf8"), "manual rate content");
+  }
+});
+
+test("new drivers and drivers with unrelated documents retain the grouped default", async () => {
+  const id = await driver();
+  const parent = path.join(workspace, "storage", "Test Driver");
+  fs.mkdirSync(path.join(parent, "Documents"), { recursive: true });
+  fs.writeFileSync(path.join(parent, "Load #not-a-folder"), "unrelated file");
+  for (const type of ["load", "loadout"]) {
+    const item = await load(id, "100", type);
+    assert.equal(item.folder_ref, path.join(parent, type === "load" ? "Loads" : "Loadout", loadFolderName("100", type)));
+  }
+  const emptyDriver = await driver("New Driver");
+  const item = await load(emptyDriver, "200");
+  assert.equal(item.folder_ref, path.join(workspace, "storage", "New Driver", "Loads", "Load #200"));
+});
+
+test("failed bookings in a flat layout remove only the new folder and preserve existing paperwork", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const id = await driver();
+  const original = manualLoad("Test Driver", ["Load #EXISTING"]);
+  t.mock.method(getStorage(), "saveFile", async () => { throw new Error("Required upload failed"); });
+  const result = await call("loads", "POST", { body: form(id, "NEW", "loadout") });
+  assert.equal(result.status, 500);
+  assert.deepEqual(fs.readdirSync(path.dirname(original.folder)), ["Load #EXISTING"]);
+  assert.equal(fs.readFileSync(original.file, "utf8"), "manual rate content");
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+});
+
+test("layout inspection errors abort booking instead of creating folders in a different location", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const id = await driver();
+  const original = manualLoad("Test Driver", ["Load #EXISTING"]);
+  const parent = path.dirname(original.folder);
+  const read = fs.readdirSync;
+  const scan = t.mock.method(fs, "readdirSync", (directory, ...args) => {
+    if (directory === parent) throw Object.assign(new Error("Cannot inspect driver layout"), { code: "EACCES" });
+    return read(directory, ...args);
+  });
+  try {
+    const result = await call("loads", "POST", { body: form(id, "NEW") });
+    assert.equal(result.status, 500);
+    assert.match(result.data.error, /Cannot inspect driver layout/);
+    assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM loads")).n, 0);
+  } finally {
+    scan.mock.restore();
+  }
+  assert.deepEqual(fs.readdirSync(parent), ["Load #EXISTING"]);
+  fs.writeFileSync(path.join(parent, "Loads"), "not a folder");
+  const result = await call("loads", "POST", { body: form(id, "NEW") });
+  assert.equal(result.status, 409);
+  assert.match(result.data.error, /grouping path is not a folder/);
+  assert.equal(fs.readFileSync(original.file, "utf8"), "manual rate content");
+});
+
+test("reassigned loads join a flat destination layout and keep it through archive and restore", async () => {
+  const source = await driver("Grouped");
+  const destination = await driver("Flat");
+  const original = manualLoad("Flat", ["Load #EXISTING"]);
+  const parent = path.dirname(original.folder);
+  for (const type of ["load", "loadout"]) {
+    const item = await load(source, "100", type);
+    const moved = await call("load", "PATCH", { id: item.id, body: { driver_id: destination } });
+    assert.equal(moved.status, 200);
+    assert.equal(moved.data.folder_ref, path.join(parent, loadFolderName("100", type)));
+    const archived = await call("archive", "POST", { id: item.id, body: { archived: true } });
+    assert.equal(archived.status, 200);
+    assert.equal(archived.data.folder_ref, path.join(parent, loadFolderName("100", type, true)));
+    const restored = await call("archive", "POST", { id: item.id, body: { archived: false } });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.data.folder_ref, moved.data.folder_ref);
+    assert.equal((await call("file", "GET", { id: item.files[0].id })).data, "rate content");
+  }
+  assert.equal(fs.existsSync(path.join(parent, "Loads")), false);
+  assert.equal(fs.existsSync(path.join(parent, "Loadout")), false);
+  assert.equal(fs.readFileSync(original.file, "utf8"), "manual rate content");
 });
 
 test("directly imported loads support uploads, archive, restore, and later reassignment", async () => {
@@ -478,7 +979,7 @@ test("directly imported loads support uploads, archive, restore, and later reass
   await call("sync", "POST");
   const target = await driver("Reassigned");
   for (const document of documents) {
-    const item = db.prepare("SELECT * FROM loads WHERE folder_ref = ?").get(document.folder);
+    const item = await db.one("SELECT * FROM loads WHERE folder_ref = $1", [document.folder]);
     const body = new FormData();
     body.set("file", new File(["invoice content"], "invoice.txt"));
     body.set("category", "invoice");
@@ -506,6 +1007,9 @@ test("directly imported loads support uploads, archive, restore, and later reass
 test("direct destination conflicts block reassignment and archive without changing paperwork", async () => {
   const first = await driver("First");
   const second = await driver("Second");
+  for (const grouping of ["Loads", "Loadout"]) {
+    fs.mkdirSync(path.join(workspace, "storage", "First", grouping), { recursive: true });
+  }
   for (const [number, type, folder] of [
     ["100", "load", "Load #100"], ["200", "load", "Archived - Load #200"],
     ["300", "loadout", "Loadout #300"], ["400", "loadout", "Archived - Loadout #400"],
@@ -534,7 +1038,7 @@ test("sync archives deleted folders in both layouts without deleting metadata or
   assert.equal((await call("sync", "POST")).data.loadsImported, 6);
   const originals = [];
   for (const document of documents) {
-    const { id } = db.prepare("SELECT id FROM loads WHERE folder_ref = ?").get(document.folder);
+    const { id } = await db.one("SELECT id FROM loads WHERE folder_ref = $1", [document.folder]);
     const result = await call("load", "PATCH", { id, body: { status: "invoiced", rate_amount: 1200, notes: "Keep these dispatch notes" } });
     assert.equal(result.status, 200);
     originals.push(result.data);
@@ -555,19 +1059,19 @@ test("sync archives deleted folders in both layouts without deleting metadata or
   }
   assert.deepEqual((await call("loads", "GET")).data.map((item) => item.load_number).sort(), ["500", "600"]);
   assert.equal((await call("loads", "GET", { query: "archived=archived" })).data.length, 4);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM files").get().n, 6);
+  assert.equal((await db.one("SELECT COUNT(*)::integer AS n FROM files")).n, 6);
   assert.equal(fs.readFileSync(keeper.file, "utf8"), "manual rate content");
-  const archived = db.prepare("SELECT id, archived_at FROM loads ORDER BY id").all();
+  const archived = await db.all("SELECT id, archived_at FROM loads ORDER BY id");
   const repeated = await call("sync", "POST");
   assert.equal(repeated.data.loadsArchived, 0);
   assert.deepEqual(repeated.data.errors, []);
-  assert.deepEqual(db.prepare("SELECT id, archived_at FROM loads ORDER BY id").all(), archived);
+  assert.deepEqual(await db.all("SELECT id, archived_at FROM loads ORDER BY id"), archived);
 });
 
 test("missing-folder loads cannot be restored until their folder is recovered and never reactivate through sync", async () => {
   const document = manualLoad("Driver", ["Load #100"]);
   await call("sync", "POST");
-  const { id } = db.prepare("SELECT id FROM loads").get();
+  const { id } = await db.one("SELECT id FROM loads");
   const original = (await call("load", "GET", { id })).data;
   fs.rmSync(document.folder, { recursive: true });
   assert.equal((await call("sync", "POST")).data.loadsArchived, 1);
@@ -692,14 +1196,63 @@ test("sync keeps unlinked loads and failed archive updates intact", async () => 
   const failed = await load(id, "200");
   fs.rmSync(unlinked.folder_ref, { recursive: true });
   fs.rmSync(failed.folder_ref, { recursive: true });
-  db.prepare("UPDATE loads SET folder_ref = '' WHERE id = ?").run(unlinked.id);
-  db.exec("CREATE TRIGGER reject_edit BEFORE UPDATE ON loads BEGIN SELECT RAISE(ABORT,'forced archive failure'); END");
+  await db.query("UPDATE loads SET folder_ref = '' WHERE id = $1", [unlinked.id]);
+  await rejectLoadChanges("UPDATE", "forced archive failure");
   const result = await call("sync", "POST");
   assert.equal(result.data.loadsArchived, 0);
   assert.ok(result.data.errors.some((error) => /No storage folder is linked/.test(error)));
   assert.ok(result.data.errors.some((error) => /forced archive failure/.test(error)));
   assert.deepEqual((await call("load", "GET", { id: unlinked.id })).data, { ...unlinked, folder_ref: "" });
   assert.deepEqual((await call("load", "GET", { id: failed.id })).data, failed);
+});
+
+test("read-only Drive routes reject storage-changing actions but keep dashboard-only edits and sync available", async (t) => {
+  const first = await driver("First");
+  const second = await driver("Second");
+  const item = await load(first);
+  const storage = getStorage();
+  const original = Object.getOwnPropertyDescriptor(storage, "readOnly");
+  Object.defineProperty(storage, "readOnly", { value: true, configurable: true });
+  t.after(() => Object.defineProperty(storage, "readOnly", original));
+  for (const method of ["createLoadFolder", "saveFile", "deleteFile", "moveLoadFolder", "renameDriverFolder"]) {
+    t.mock.method(storage, method, DriveStorage.prototype[method].bind(storage));
+  }
+  const body = new FormData();
+  body.set("file", new File(["new document"], "new.txt"));
+  const before = async () => JSON.stringify([
+    await db.all("SELECT * FROM drivers ORDER BY id"),
+    await db.all("SELECT * FROM loads ORDER BY id"),
+    await db.all("SELECT * FROM files ORDER BY id"),
+  ]);
+  const snapshot = await before();
+  for (const action of [
+    () => call("loads", "POST", { body: form(first, "200") }),
+    () => call("upload", "POST", { id: item.id, body }),
+    () => call("file", "DELETE", { id: item.files[0].id }),
+    () => call("load", "PATCH", { id: item.id, body: { driver_id: second, notes: "Must not persist" } }),
+    () => call("driver", "PATCH", { id: first, body: { name: "Renamed", phone: "Must not persist" } }),
+    () => call("archive", "POST", { id: item.id, body: { archived: true } }),
+    () => call("load", "DELETE", { id: item.id }),
+    () => call("drivers", "POST", { body: { name: "Unlinked Driver" } }),
+    () => call("driver", "DELETE", { id: second }),
+  ]) {
+    const result = await action();
+    assert.equal(result.status, 403, JSON.stringify(result.data));
+    assert.match(result.data.error, /read-only/);
+    assert.equal(await before(), snapshot);
+    assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
+  }
+  const edited = await call("load", "PATCH", { id: item.id, body: { notes: "Dashboard note", status: "picked_up" } });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.data.notes, "Dashboard note");
+  assert.equal(edited.data.folder_ref, item.folder_ref);
+  assert.equal((await call("driver", "PATCH", { id: first, body: { truck: "204" } })).status, 200);
+  manualLoad("Imported Driver", ["Load #300"]);
+  const synced = await call("sync", "POST");
+  assert.deepEqual(synced.data.errors, []);
+  assert.equal(synced.data.driversImported, 1);
+  assert.equal(synced.data.loadsImported, 1);
+  assert.equal((await call("file", "GET", { id: item.files[0].id })).data, "rate content");
 });
 
 test("load list composes driver/type/status/archive/date filters and sorting", async () => {
@@ -716,7 +1269,7 @@ test("load list composes driver/type/status/archive/date filters and sorting", a
   assert.deepEqual(sorted.data.map((item) => item.id), [one.id, three.id, two.id]);
   assert.equal((await call("loads", "GET", { query: "date_from=2026-09-03" })).data.length, 0);
   assert.equal((await call("loads", "GET", { query: "date_field=invoice_due_date&date_to=2026-10-01" })).data.length, 1);
-  for (const query of ["driver_id=-1", "load_type=no", "status=no", "archived=no", "date_field=no",
+  for (const query of ["driver_id=-1", "driver_id=2147483648", "driver_id=9007199254740991", "load_type=no", "status=no", "archived=no", "date_field=no",
     "date_from=2026-02-30", "date_from=2026-09-30&date_to=2026-09-01", "sort=no", "order=no"]) {
     assert.equal((await call("loads", "GET", { query })).status, 400, query);
   }
@@ -733,31 +1286,115 @@ test("overdue labels use explicit dates and ignore completed or archived loads",
   assert.equal(todayLocal(new Date(2026, 8, 2)), "2026-09-02");
 });
 
-test("data lock serializes mutations and releases after failures", async () => {
-  const events = [];
-  let release;
-  const hold = new Promise((resolve) => { release = resolve; });
-  const first = withDataLock(async () => { events.push("first"); await hold; events.push("released"); });
-  const second = withDataLock(async () => { events.push("second"); });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events, ["first"]);
-  release();
-  await Promise.all([first, second]);
-  assert.deepEqual(events, ["first", "released", "second"]);
-  await assert.rejects(withDataLock(() => { throw new Error("expected"); }), /expected/);
-  assert.equal(fs.existsSync(path.join(workspace, "data", "dispatch-local.db.lock")), false);
+test("sync discovery cannot observe an in-progress driver rename while dashboard reads remain available", async (t) => {
+  const id = await driver("Discovery Guard Driver");
+  await load(id, "DISCOVERY-GUARD");
+  const storage = getStorage();
+  const original = storage.listDriverFolders;
+  const scanning = deferred();
+  const release = deferred();
+  t.mock.method(storage, "listDriverFolders", async () => {
+    scanning.resolve();
+    await release.promise;
+    return original.call(storage);
+  });
+  const syncing = call("sync", "POST");
+  let result;
+  try {
+    await promptly(scanning.promise);
+    assert.equal((await promptly(call("loads", "GET"))).status, 200);
+    const renamed = await promptly(call("driver", "PATCH", { id, body: { name: "Uncommitted Name" } }));
+    assert.equal(renamed.status, 409, JSON.stringify(renamed.data));
+    assert.equal((await db.one("SELECT name FROM drivers WHERE id = $1", [id])).name, "Discovery Guard Driver");
+  } finally {
+    result = await finishHeldMutation(syncing, release, []);
+  }
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.deepEqual(result.data.errors, []);
+  assert.equal((await call("drivers", "GET")).data.length, 1);
 });
 
-test("an interrupted restore blocks business access until its recovery state is resolved", async () => {
-  const marker = path.join(workspace, "data", "dispatch-local.db.restore-recovery.json");
-  fs.writeFileSync(marker, "{}");
+test("load-scoped PostgreSQL locks allow reads and independent mutations while conflicts return 409", async () => {
+  const id = await driver();
+  const first = await load(id, "FIRST");
+  const second = await load(id, "SECOND");
+  const entered = deferred();
+  const release = deferred();
+  const pending = [];
+  const mutation = withDataLock(async () => {
+    await db.query("UPDATE loads SET notes = $1 WHERE id = $2", ["Uncommitted note", first.id]);
+    entered.resolve();
+    await release.promise;
+  }, { keys: [`load:${first.id}`] });
+  mutation.catch(entered.reject);
+  const run = (promise) => { pending.push(promise); return promptly(promise); };
   try {
-    await assert.rejects(withDataLock(() => assert.fail("Business action must not run")), /interrupted local restore/);
-    const result = await call("loads", "GET");
-    assert.equal(result.status, 409);
-    assert.match(result.data.error, /requires recovery/);
-    assert.equal(fs.existsSync(path.join(workspace, "data", "dispatch-local.db.lock")), false);
+    await promptly(entered.promise);
+    const detail = await run(call("load", "GET", { id: first.id }));
+    assert.equal(detail.status, 200);
+    assert.deepEqual(detail.data, first, "Readers must not see uncommitted changes");
+    const list = await run(call("loads", "GET"));
+    assert.equal(list.status, 200);
+    assert.equal(list.data.length, 2);
+    assert.equal((await run(call("drivers", "GET"))).status, 200);
+    assert.equal((await run(call("file", "GET", { id: first.files[0].id }))).data, "rate content");
+    const conflict = await run(call("load", "PATCH", { id: first.id, body: { notes: "Conflicting note" } }));
+    assert.equal(conflict.status, 409);
+    assert.match(conflict.data.error, /retry|try again|busy|progress/i);
+    const replica = callFromFreshProcess(path.join(__dirname, "..", "app", "api", "loads", "[id]", "route.ts"), "PATCH", {
+      id: first.id, body: { notes: "Conflicting replica note" },
+    });
+    assert.equal(replica.status, 409, JSON.stringify(replica.data));
+    const independent = await run(call("load", "PATCH", { id: second.id, body: { notes: "Independent note" } }));
+    assert.equal(independent.status, 200);
+    assert.equal(independent.data.notes, "Independent note");
   } finally {
-    fs.unlinkSync(marker);
+    await finishHeldMutation(mutation, release, pending);
   }
+  assert.equal((await call("load", "GET", { id: first.id })).data.notes, "Uncommitted note");
+  assert.equal((await call("load", "PATCH", { id: first.id, body: { notes: "Retried after release" } })).status, 200);
+});
+
+test("failed PostgreSQL mutations roll back their rows and release scoped locks", async () => {
+  const item = await load(await driver());
+  await assert.rejects(withDataLock(async () => {
+    await db.query("UPDATE loads SET notes = $1 WHERE id = $2", ["Must roll back", item.id]);
+    throw new Error("expected transaction failure");
+  }, { keys: [`load:${item.id}`] }), /expected transaction failure/);
+  assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+  const retried = await call("load", "PATCH", { id: item.id, body: { notes: "After rollback" } });
+  assert.equal(retried.status, 200);
+  assert.equal(retried.data.notes, "After rollback");
+});
+
+test("driver mutations require an exclusive roster lock without blocking dashboard reads", async () => {
+  const id = await driver();
+  const item = await load(id);
+  for (const drivers of ["shared", "exclusive"]) {
+    const entered = deferred();
+    const release = deferred();
+    const pending = [];
+    const mutation = withDataLock(async () => {
+      entered.resolve();
+      await release.promise;
+    }, { drivers, keys: drivers === "shared" ? [`load:${item.id}`] : [] });
+    mutation.catch(entered.reject);
+    const run = (promise) => { pending.push(promise); return promptly(promise); };
+    try {
+      await promptly(entered.promise);
+      const rename = await run(call("driver", "PATCH", { id, body: { name: "Blocked rename" } }));
+      assert.equal(rename.status, 409, drivers);
+      const create = await run(call("drivers", "POST", { body: { name: "Blocked driver" } }));
+      assert.equal(create.status, 409, drivers);
+      if (drivers === "exclusive") {
+        const edit = await run(call("load", "PATCH", { id: item.id, body: { notes: "Blocked edit" } }));
+        assert.equal(edit.status, 409);
+      }
+      assert.equal((await run(call("drivers", "GET"))).status, 200);
+      assert.deepEqual((await run(call("load", "GET", { id: item.id }))).data, item);
+    } finally {
+      await finishHeldMutation(mutation, release, pending);
+    }
+  }
+  assert.equal((await call("driver", "PATCH", { id, body: { name: "After release" } })).status, 200);
 });

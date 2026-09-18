@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
 import Sidebar from "@/components/Sidebar";
+import { StorageStatusProvider } from "@/components/StorageStatusProvider";
 
 const geistSans = localFont({
   src: "./fonts/GeistVF.woff",
@@ -27,10 +28,12 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}>
+        <StorageStatusProvider>
         <Sidebar />
         <main className="ml-[232px] min-h-screen">
           <div className="mx-auto max-w-[1200px] px-8 py-8">{children}</div>
         </main>
+        </StorageStatusProvider>
       </body>
     </html>
   );

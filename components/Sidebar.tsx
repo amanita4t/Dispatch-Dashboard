@@ -5,12 +5,13 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { sanitizeBoardReturnUrl } from "@/lib/board-navigation";
 import { IconTruck, IconPlus, IconUsers, IconFolder } from "./icons";
+import { useStorageStatus } from "./StorageStatusProvider";
 
 const nav = [
   { href: "/", label: "Load Board", icon: IconTruck },
   { href: "/loads/new", label: "Book Load", icon: IconPlus },
   { href: "/drivers", label: "Drivers", icon: IconUsers },
-  { href: "/backups", label: "Backups", icon: IconFolder },
+  { href: "/backups", label: "Backups & recovery", icon: IconFolder },
 ];
 
 function currentBoardHref(): string {
@@ -22,15 +23,9 @@ function currentBoardHref(): string {
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
-  const [storageMode, setStorageMode] = useState<string>("");
+  const { status, canWrite } = useStorageStatus();
+  const storageMode = status?.storage;
   const [boardHref, setBoardHref] = useState("/");
-
-  useEffect(() => {
-    fetch("/api/status")
-      .then((r) => r.json())
-      .then((d) => setStorageMode(d.storage))
-      .catch(() => {});
-  }, []);
 
   useEffect(() => {
     setBoardHref(currentBoardHref());
@@ -69,7 +64,7 @@ export default function Sidebar() {
         <div className="px-2 pb-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
           Operations
         </div>
-        {nav.map((item) => {
+        {nav.filter((item) => item.href !== "/loads/new" || canWrite).map((item) => {
           const active = pathname === item.href;
           const Icon = item.icon;
           return (
@@ -104,15 +99,15 @@ export default function Sidebar() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
             </span>
-            Google Drive mode
+            {status?.readOnly ? "Google Drive - read-only" : "Google Drive mode"}
           </div>
         ) : storageMode === "local" ? (
           <div
             className="flex items-center gap-2 text-[11px] font-medium text-slate-500"
-            title="Files are stored locally. Set STORAGE_MODE=drive with Google credentials to enable Drive."
+            title="Development-only local documents. Dashboard records are stored in PostgreSQL. Vercel requires Google Drive."
           >
             <span className="inline-flex h-2 w-2 rounded-full bg-slate-600" />
-            Local storage mode
+            Local documents · development
           </div>
         ) : null}
       </div>

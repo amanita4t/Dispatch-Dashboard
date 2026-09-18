@@ -9,6 +9,8 @@
 # testing
 /coverage
 /tests/.backup-fixture-*/
+/tests/.oauth-helper-fixture-*/
+/.dispatch-workflows-*/
 
 # next.js
 /.next/

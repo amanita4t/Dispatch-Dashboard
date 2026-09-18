@@ -63,6 +63,11 @@ export interface LoadDetail extends LoadWithDriver {
   files: FileRecord[];
 }
 
+export interface StorageStatus {
+  storage: "local" | "drive";
+  readOnly: boolean;
+}
+
 export interface SyncSummary {
   driversScanned: number;
   driversImported: number;
@@ -72,4 +77,8 @@ export interface SyncSummary {
   skippedExisting: number;
   skippedArchived: number;
   errors: string[];
+}
+
+export interface SyncResponse extends SyncSummary {
+  cursor: string | null;
 }

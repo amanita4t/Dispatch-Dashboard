@@ -1,18 +1,20 @@
 import { NextResponse } from "next/server";
 import db from "@/lib/db";
 import { apiHandler, readJsonObject } from "@/lib/api";
-import { assertDriverNameAvailable, findDriver } from "@/lib/loads";
-import type { DriverSummary } from "@/lib/models";
+import { assertDriverNameAvailable } from "@/lib/loads";
+import type { DriverRecord, DriverSummary } from "@/lib/models";
 import { withDataLock } from "@/lib/mutation-lock";
 import { text } from "@/lib/validation";
+import { assertStorageWritable, getStorage } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 export async function GET() {
-  return apiHandler(() => withDataLock(() => NextResponse.json(db.prepare<[], DriverSummary>(
-    `SELECT d.*, COUNT(l.id) AS load_count FROM drivers d LEFT JOIN loads l ON l.driver_id = d.id
-     GROUP BY d.id ORDER BY d.name COLLATE NOCASE`
-  ).all())));
+  return apiHandler(async () => NextResponse.json(await db.all<DriverSummary>(
+    `SELECT d.*, COUNT(l.id)::int AS load_count FROM drivers d LEFT JOIN loads l ON l.driver_id = d.id
+     GROUP BY d.id ORDER BY lower(d.name), d.id`
+  )));
 }
 
 export async function POST(req: Request) {
@@ -21,10 +23,14 @@ export async function POST(req: Request) {
     const name = text(body.name, "Driver name", true);
     const phone = text(body.phone ?? "", "Phone");
     const truck = text(body.truck ?? "", "Truck");
-    return withDataLock(() => {
-      assertDriverNameAvailable(name);
-      const result = db.prepare("INSERT INTO drivers (name, phone, truck) VALUES (?, ?, ?)").run(name, phone, truck);
-      return NextResponse.json(findDriver(Number(result.lastInsertRowid)), { status: 201 });
-    });
+    return withDataLock(async () => {
+      assertStorageWritable(getStorage());
+      await assertDriverNameAvailable(name);
+      const driver = await db.one<DriverRecord>(
+        "INSERT INTO drivers (name, phone, truck) VALUES ($1, $2, $3) RETURNING *", [name, phone, truck]
+      );
+      if (!driver) throw new Error("Created driver record could not be read");
+      return NextResponse.json(driver, { status: 201 });
+    }, { drivers: "exclusive" });
   });
 }

@@ -4,12 +4,13 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
+import { useStorageStatus } from "@/components/StorageStatusProvider";
 import { STATUSES, LOAD_TYPE_OPTIONS, fmtMoney, loadTypeLabel, initials } from "@/lib/constants";
 import { BOARD_FILTER_DEFAULTS, boardUrl, readBoardFilters, withBoardReturn, type BoardFilters } from "@/lib/board-navigation";
 import { requestJson } from "@/lib/client-api";
 import { overdueLabel } from "@/lib/dates";
 import { errorMessage } from "@/lib/errors";
-import type { LoadDetail, LoadStatus, LoadWithDriver, SyncSummary } from "@/lib/models";
+import type { LoadDetail, LoadStatus, LoadWithDriver, SyncResponse, SyncSummary } from "@/lib/models";
 import { useActionLock } from "@/lib/use-action-lock";
 import { useDriverRoster } from "@/lib/use-driver-roster";
 import { useLocalToday } from "@/lib/use-local-today";
@@ -17,6 +18,15 @@ import { IconPlus, IconSearch, IconSync, IconTruck, IconRoute, IconDollar, IconF
 
 const filterCls = "rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[13px] shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20";
 const filterLabelCls = "mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500";
+const MAX_SYNC_BATCHES_PER_RUN = 250;
+
+function syncSummaryMessage(summary: SyncSummary): string {
+  let message = `${summary.driversScanned} driver(s) scanned; ${summary.driversImported} driver(s), ${summary.loadsImported} load(s), ${summary.filesImported} file(s) imported.`;
+  if (summary.loadsArchived) message += ` ${summary.loadsArchived} load(s) moved to Archived because their folders are missing. Deleted documents were not recovered.`;
+  if (summary.skippedArchived) message += ` ${summary.skippedArchived} archived folder(s) skipped.`;
+  if (summary.errors.length) message += ` ${summary.errors.length} error(s): ${summary.errors.join("; ")}`;
+  return message;
+}
 
 function SortableHeading({
   field, label, sort, order, onSort, right = false,
@@ -46,6 +56,7 @@ export default function Dashboard() {
 }
 
 function LoadBoard() {
+  const { canWrite } = useStorageStatus();
   const router = useRouter();
   const searchParams = useSearchParams();
   const navigationUrl = boardUrl(readBoardFilters(searchParams));
@@ -60,12 +71,16 @@ function LoadBoard() {
   const [actionError, setActionError] = useState("");
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [syncMsg, setSyncMsg] = useState("");
+  const [syncCursor, setSyncCursor] = useState<string | null>(null);
+  const syncRequest = useRef<AbortController | null>(null);
   const { pending, begin, finish } = useActionLock();
   const syncing = pending === "sync";
   const today = useLocalToday();
   const searchHistoryStarted = useRef(false);
 
   const refresh = useCallback(() => setRefreshVersion((version) => version + 1), []);
+
+  useEffect(() => () => syncRequest.current?.abort(), []);
 
   useEffect(() => {
     const current = readBoardFilters(new URLSearchParams(window.location.search));
@@ -136,23 +151,49 @@ function LoadBoard() {
     }
   }
 
-  async function syncFromStorage() {
+  async function syncFromStorage(startNew = false) {
     if (!begin("sync")) return;
-    setSyncMsg("");
+    const controller = new AbortController();
+    syncRequest.current = controller;
+    let cursor = startNew ? null : syncCursor;
+    if (startNew) setSyncCursor(null);
+    if (cursor) setSyncMsg((previous) => previous || "Resuming saved sync…");
+    else setSyncMsg("Starting sync…");
     setActionError("");
     try {
-      const s = await requestJson<SyncSummary>("/api/sync", { method: "POST" });
-      let msg = `Sync complete: ${s.driversImported} driver(s), ${s.loadsImported} load(s), ${s.filesImported} file(s) imported.`;
-      if (s.loadsArchived) msg += ` ${s.loadsArchived} load(s) moved to Archived because their folders are missing. Deleted documents were not recovered.`;
-      if (s.skippedArchived) msg += ` ${s.skippedArchived} archived folder(s) skipped.`;
-      if (s.errors.length) msg += ` ${s.errors.length} error(s): ${s.errors.join("; ")}`;
-      setSyncMsg(msg);
-      refresh();
-      await refreshDrivers();
+      for (let batch = 1; batch <= MAX_SYNC_BATCHES_PER_RUN; batch++) {
+        const summary = await requestJson<SyncResponse>("/api/sync", {
+          method: "POST",
+          signal: controller.signal,
+          ...(cursor ? {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cursor }),
+          } : {}),
+        });
+        if (controller.signal.aborted) return;
+        if (!summary || (summary.cursor !== null && (typeof summary.cursor !== "string" || !summary.cursor.trim()))) {
+          throw new Error("The server returned an invalid sync cursor. Refresh the application before retrying.");
+        }
+        const message = syncSummaryMessage(summary);
+        cursor = summary.cursor;
+        setSyncCursor(cursor);
+        setSyncMsg(cursor ? `Sync progress (${batch} batch(es) this run): ${message}` : `Sync complete: ${message}`);
+        if (cursor === null) return;
+      }
+      throw new Error("The per-run batch limit was reached. Continue the saved sync to process the remaining folders.");
     } catch (failure: unknown) {
-      setActionError(`Sync failed: ${errorMessage(failure)}`);
+      if (!controller.signal.aborted) {
+        setActionError(cursor
+          ? `Sync paused: ${errorMessage(failure)} Choose Resume Sync to continue. Saved runs expire after 24 hours; start a new sync if the run has expired.`
+          : `Sync failed: ${errorMessage(failure)} No continuation was received; retry Sync Storage.`);
+      }
     } finally {
-      finish();
+      if (!controller.signal.aborted) {
+        refresh();
+        await refreshDrivers();
+        if (!controller.signal.aborted) finish();
+      }
+      if (syncRequest.current === controller) syncRequest.current = null;
     }
   }
 
@@ -187,26 +228,36 @@ function LoadBoard() {
         </div>
         <div className="flex items-center gap-2.5">
           <button
-            onClick={syncFromStorage}
+            onClick={() => syncFromStorage()}
             disabled={pending !== null}
-            title="Import new drivers, loads, and documents, and archive loads whose folders were deleted"
+            title="Import drivers, loads, and documents in resumable batches, and archive loads whose folders were deleted"
             className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3.5 py-2 text-[13px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-50"
           >
             <IconSync className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
-            {syncing ? "Syncing…" : "Sync Storage"}
+            {syncing ? "Syncing…" : syncCursor ? "Resume Sync" : "Sync Storage"}
           </button>
-          <Link
+          {syncCursor && !syncing && (
+            <button
+              onClick={() => syncFromStorage(true)}
+              disabled={pending !== null}
+              title="Start a new scan instead of continuing the saved run"
+              className="rounded-md px-2 py-2 text-[12px] font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+            >
+              Start new sync
+            </button>
+          )}
+          {canWrite && <Link
             href={withBoardReturn("/loads/new", returnTo)}
             className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-blue-700"
           >
             <IconPlus className="h-3.5 w-3.5" />
             Book Load
-          </Link>
+          </Link>}
         </div>
       </div>
 
       {syncMsg && (
-        <div role="status" className="mb-5 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-[13px] text-blue-900">
+        <div role="status" aria-live="polite" aria-busy={syncing} className="mb-5 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-[13px] text-blue-900">
           {syncMsg}
         </div>
       )}
