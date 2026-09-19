@@ -231,8 +231,10 @@ Duplicate driver names or duplicate load folders across layouts are reported as
 conflicts rather than merged.
 
 The board awaits sequential, bounded sync batches and displays cumulative
-progress. `POST /api/sync` without a body starts a run; subsequent requests send
+progress. `POST /api/sync` with JSON `{}` starts a run; subsequent requests send
 JSON `{ "cursor": "<returned cursor>" }` until the response has `cursor: null`.
+Empty requests from older clients also start a run, including zero-byte streams
+forwarded by serverless hosts. Malformed JSON and invalid cursors are rejected.
 Counters and errors are cumulative for the run, not values to add across pages.
 After a transient error, **Resume Sync** continues the saved cursor. Runs expire
 after 24 hours; use **Start new sync** if a saved run has expired. The browser

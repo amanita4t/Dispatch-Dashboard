@@ -379,7 +379,8 @@ test("the board awaits cursor batches, prevents duplicate syncs and displays the
   gate.resolve();
   await Promise.all([syncing, duplicate]);
   assert.equal(requests.length, 3);
-  assert.equal(requests[0].body, undefined);
+  assert.deepEqual(JSON.parse(requests[0].body), {});
+  assert.equal(requests[0].headers["Content-Type"], "application/json");
   for (const request of requests.slice(1)) {
     assert.deepEqual(JSON.parse(request.body), { cursor: SYNC_CURSOR });
     assert.equal(request.headers["Content-Type"], "application/json");
@@ -418,7 +419,7 @@ test("a transient sync failure preserves the cursor and resumes without starting
   assert.doesNotMatch(elementText(page.render()), /Connection lost|Start new sync|Resume Sync/);
 });
 
-test("an expired sync can be explicitly replaced by a new bodyless request", async (t) => {
+test("an expired sync can be explicitly replaced by a new empty JSON object", async (t) => {
   const requests = [];
   t.mock.method(globalThis, "fetch", async (url, options) => {
     if (url !== "/api/sync") return Response.json([]);
@@ -430,7 +431,8 @@ test("an expired sync can be explicitly replaced by a new bodyless request", asy
   await button(page.render(), "Sync Storage").props.onClick();
   assert.match(elementText(page.render()), /Sync run expired/);
   await button(page.render(), "Start new sync").props.onClick();
-  assert.equal(requests[2].body, undefined);
+  assert.deepEqual(JSON.parse(requests[2].body), {});
+  assert.equal(requests[2].headers["Content-Type"], "application/json");
   assert.match(elementText(page.render()), /Sync complete/);
 });
 

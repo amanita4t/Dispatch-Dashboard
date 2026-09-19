@@ -646,6 +646,64 @@ test("failed physical deletion keeps metadata and archived files are read-only",
   assert.equal((await call("upload", "POST", { id: item.id, body })).status, 409);
 });
 
+test("sync accepts zero-byte serverless request streams and explicit empty JSON objects", async () => {
+  const document = manualLoad("Empty Request Driver", ["Load #EMPTY-REQUEST"]);
+  const requests = [
+    new Request("http://localhost/api/sync", { method: "POST" }),
+    new Request("http://localhost/api/sync", {
+      method: "POST", duplex: "half",
+      body: new ReadableStream({ start(controller) { controller.close(); } }),
+    }),
+    new Request("http://localhost/api/sync", {
+      method: "POST", duplex: "half", headers: { "Content-Length": "0", "Content-Type": "application/json" },
+      body: new ReadableStream({ start(controller) { controller.close(); } }),
+    }),
+    new Request("http://localhost/api/sync", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }),
+  ];
+  assert.equal(requests[0].body, null);
+  assert.ok(requests[1].body, "Vercel can expose an empty request as a non-null stream");
+  for (const request of requests) {
+    const response = await routes.sync.POST(request);
+    const summary = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(summary));
+    assert.ok(summary.cursor === null || typeof summary.cursor === "string");
+    const complete = summary.cursor === null ? { status: 200, data: summary }
+      : await call("sync", "POST", { body: { cursor: summary.cursor } });
+    assert.equal(complete.status, 200, JSON.stringify(complete.data));
+    assert.equal(complete.data.cursor, null);
+    assert.deepEqual(complete.data.errors, []);
+  }
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM sync_runs")).n, requests.length);
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM loads")).n, 1);
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM files")).n, 1);
+  assert.equal(fs.readFileSync(document.file, "utf8"), "manual rate content");
+});
+
+test("sync rejects malformed JSON and invalid cursors without starting a run", async (t) => {
+  const scan = t.mock.method(getStorage(), "listDriverFolders", async () => assert.fail("Invalid sync input must not scan storage"));
+  for (const body of ["{", " ", "null", "[]", '"text"', '{"cursor":', '{"cursor":null}', '{"cursor":""}', '{"cursor":12}', '{"cursor":"invalid"}']) {
+    const response = await routes.sync.POST(new Request("http://localhost/api/sync", {
+      method: "POST", headers: { "Content-Type": "application/json", "Content-Length": "0" }, body,
+    }));
+    assert.equal(response.status, 400, body);
+    assert.match((await response.json()).error, /Invalid JSON body|A JSON object is required|Invalid sync cursor/);
+  }
+  assert.equal(scan.mock.callCount(), 0);
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM sync_runs")).n, 0);
+});
+
+test("other JSON endpoints still reject an empty request stream", async () => {
+  const response = await routes.drivers.POST(new Request("http://localhost/api/drivers", {
+    method: "POST", duplex: "half", headers: { "Content-Type": "application/json" },
+    body: new ReadableStream({ start(controller) { controller.close(); } }),
+  }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid JSON body" });
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM drivers")).n, 0);
+});
+
 test("sync refuses another driver's matching load folder and ignores archived records", async () => {
   const first = await driver("First");
   await driver("Second");

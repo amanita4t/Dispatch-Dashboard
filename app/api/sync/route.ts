@@ -294,7 +294,7 @@ async function continueSync(id: string): Promise<SyncResponse> {
 
 export async function POST(req: Request) {
   return apiHandler(async () => {
-    const body = req.body ? await readJsonObject(req) : {};
+    const body = await readJsonObject(req, { allowEmpty: true });
     if (body.cursor !== undefined && (typeof body.cursor !== "string" ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.cursor))) {
       throw new RequestError("Invalid sync cursor");

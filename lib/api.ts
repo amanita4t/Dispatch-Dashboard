@@ -32,10 +32,15 @@ export async function apiHandler(action: () => Promise<Response> | Response): Pr
   }
 }
 
-export async function readJsonObject(req: Request): Promise<Record<string, unknown>> {
+export async function readJsonObject(
+  req: Request,
+  options: { allowEmpty?: boolean } = {}
+): Promise<Record<string, unknown>> {
+  const text = await req.text();
+  if (options.allowEmpty && text.length === 0) return {};
   let body: unknown;
   try {
-    body = await req.json();
+    body = JSON.parse(text);
   } catch (error) {
     if (error instanceof SyntaxError) throw new RequestError("Invalid JSON body");
     throw error;

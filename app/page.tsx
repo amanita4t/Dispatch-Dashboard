@@ -165,10 +165,8 @@ function LoadBoard() {
         const summary = await requestJson<SyncResponse>("/api/sync", {
           method: "POST",
           signal: controller.signal,
-          ...(cursor ? {
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cursor }),
-          } : {}),
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cursor ? { cursor } : {}),
         });
         if (controller.signal.aborted) return;
         if (!summary || (summary.cursor !== null && (typeof summary.cursor !== "string" || !summary.cursor.trim()))) {
