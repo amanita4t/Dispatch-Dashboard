@@ -230,28 +230,37 @@ trip details and a zero rate until edited. Repeated syncs do not duplicate recor
 Duplicate driver names or duplicate load folders across layouts are reported as
 conflicts rather than merged.
 
-The board awaits sequential, bounded sync batches and displays cumulative
-progress. `POST /api/sync` with JSON `{}` starts a run; subsequent requests send
+The board awaits sequential, bounded sync batches and displays a compact status,
+without file paths, folder numbers, filenames, or per-batch details.
+`POST /api/sync` with JSON `{}` starts a run; subsequent requests send
 JSON `{ "cursor": "<returned cursor>" }` until the response has `cursor: null`.
 Empty requests from older clients also start a run, including zero-byte streams
 forwarded by serverless hosts. Malformed JSON and invalid cursors are rejected.
 Counters and errors are cumulative for the run, not values to add across pages.
+Detailed errors remain in the sync response and server logs; the board reports
+partial failures without displaying those details.
 After a transient error, **Resume Sync** continues the saved cursor. Runs expire
 after 24 hours; use **Start new sync** if a saved run has expired. The browser
 pauses after 250 batches per action as a safety limit; resume to continue a larger
 scan. Leaving the board aborts its pending request and stops automatic continuation.
 Do not assume that an aborted response rolled back the last server batch.
 
-Sync also moves active loads to **Archived** when their linked load folders are
-confirmed missing. The sync summary reports how many were archived. Load details,
+Sync also moves active loads to **Archived** when their linked load folder or its
+entire driver folder is missing. A deleted driver folder archives its linked active
+loads of both types, but the driver record is retained. The compact result reports
+how many loads were archived. Load details,
 status, notes, and document records are kept; deleted folders/documents are not
 recreated, and other folders are not moved or deleted.
 
 Deletion reconciliation is skipped after failed scans or ambiguous folder matches.
-An unavailable storage root or whole driver folder is reported instead of being
-treated as proof that its loads were deleted. Drive folders are auto-archived only
-when Drive confirms they are in Trash; a not-found/access error alone is ambiguous
-and leaves the record unchanged.
+An unavailable storage root, explicit permission denial, failed request, or
+unconfirmed folder metadata is reported instead of triggering mass archiving.
+After confirming the configured Drive root is readable and not trashed, sync
+treats a missing driver folder, a trashed load folder, or a load-folder 404 as
+missing. A Drive 404 can also mean access to that particular folder was removed;
+by default its load is archived, not deleted, so its records remain recoverable.
+Returning folders do not automatically reactivate archived loads: recover the
+original folder and use **Restore**.
 
 ## Archiving, restoring, and reassignment
 

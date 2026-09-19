@@ -1188,24 +1188,151 @@ test("discovery, scan, and access failures never get interpreted as deleted load
   assert.equal((await call("sync", "POST")).data.loadsArchived, 1);
 });
 
-test("unavailable storage roots and driver folders do not archive their loads", async () => {
+test("an unavailable storage root does not archive its loads", async () => {
   const item = await load(await driver());
   const storage = path.join(workspace, "storage");
-  const driverFolder = path.join(storage, "Test Driver");
-  for (const source of [storage, driverFolder]) {
-    const offline = path.join(workspace, "temporarily-offline");
-    fs.renameSync(source, offline);
-    try {
-      const result = await call("sync", "POST");
-      assert.equal(result.data.loadsArchived, 0);
-      assert.ok(result.data.errors.some((error) => /storage folder is unavailable/.test(error)));
-      assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
-      assert.equal(fs.existsSync(source), false);
-    } finally {
-      fs.renameSync(offline, source);
-    }
+  const offline = path.join(workspace, "temporarily-offline");
+  fs.renameSync(storage, offline);
+  try {
+    const result = await call("sync", "POST");
+    assert.equal(result.data.loadsArchived, 0);
+    assert.ok(result.data.errors.some((error) => /storage root is unavailable/.test(error)));
+    assert.deepEqual((await call("load", "GET", { id: item.id })).data, item);
+    assert.equal(fs.existsSync(storage), false);
+  } finally {
+    fs.renameSync(offline, storage);
   }
   assert.equal(fs.readFileSync(item.files[0].storage_ref, "utf8"), "rate content");
+});
+
+test("sync archives both load types when the entire driver folder disappears and retains all records", async () => {
+  const removed = [
+    manualLoad("Removed Driver", ["Load #DRIVER-100"]),
+    manualLoad("Removed Driver", ["Loads", "Load #DRIVER-200"]),
+    manualLoad("Removed Driver", ["Loadout #DRIVER-300"]),
+    manualLoad("Removed Driver", ["Loadout", "Loadout #DRIVER-400"]),
+  ];
+  const keeper = manualLoad("Kept Driver", ["Load #KEEPER"]);
+  assert.equal((await call("sync", "POST")).data.loadsImported, 5);
+  const originals = [];
+  for (const document of removed) {
+    const row = await db.one("SELECT id FROM loads WHERE folder_ref = $1", [document.folder]);
+    originals.push((await call("load", "GET", { id: row.id })).data);
+  }
+  const driverFolder = path.join(workspace, "storage", "Removed Driver");
+  fs.rmSync(driverFolder, { recursive: true });
+  const result = await call("sync", "POST");
+  assert.equal(result.status, 200);
+  assert.equal(result.data.loadsArchived, 4);
+  assert.deepEqual(result.data.errors, []);
+  for (const original of originals) {
+    const archived = (await call("load", "GET", { id: original.id })).data;
+    assert.ok(archived.archived_at);
+    assert.deepEqual(archived, { ...original, archived_at: archived.archived_at });
+  }
+  assert.deepEqual((await call("loads", "GET")).data.map((row) => row.load_number), ["KEEPER"]);
+  assert.equal((await call("drivers", "GET")).data.length, 2);
+  assert.equal((await db.one("SELECT COUNT(*)::int AS n FROM files")).n, 5);
+  assert.equal(fs.existsSync(driverFolder), false);
+  assert.equal(fs.readFileSync(keeper.file, "utf8"), "manual rate content");
+  assert.equal((await call("archive", "POST", { id: originals[0].id, body: { archived: false } })).status, 409);
+  assert.equal((await call("sync", "POST")).data.loadsArchived, 0);
+  const timestamps = await db.all("SELECT id, archived_at FROM loads WHERE archived_at IS NOT NULL ORDER BY id");
+  fs.rmSync(path.join(workspace, "storage", "Kept Driver"), { recursive: true });
+  assert.deepEqual(fs.readdirSync(path.join(workspace, "storage")), []);
+  const emptyRoot = await call("sync", "POST");
+  assert.equal(emptyRoot.data.loadsArchived, 1);
+  assert.deepEqual(emptyRoot.data.errors, []);
+  assert.equal((await call("loads", "GET")).data.length, 0);
+  const previouslyArchived = new Set(timestamps.map((row) => row.id));
+  assert.deepEqual((await db.all("SELECT id, archived_at FROM loads WHERE archived_at IS NOT NULL ORDER BY id"))
+    .filter((row) => previouslyArchived.has(row.id)), timestamps);
+});
+
+test("Drive sync archives missing drivers, trashed loads, and permanent deletions without writing to Drive", async (t) => {
+  const removedDriver = await driver("Removed Driver");
+  const availableDriver = await driver("Available Driver");
+  const seeds = [
+    [removedDriver, "DRIVER-LOAD", "load", "missing-driver-load"],
+    [removedDriver, "DRIVER-LOADOUT", "loadout", "missing-driver-loadout"],
+    [availableDriver, "TRASHED", "load", "trashed-load"],
+    [availableDriver, "DELETED", "loadout", "deleted-load"],
+    [availableDriver, "ACCESS", "load", "access-load"],
+    [availableDriver, "KEEPER", "load", "keeper-load"],
+  ];
+  for (const [driverId, number, type, reference] of seeds) {
+    const item = await load(driverId, number, type);
+    await db.query("UPDATE loads SET folder_ref = $1 WHERE id = $2", [reference, item.id]);
+    await db.query("UPDATE files SET storage_ref = $1 WHERE load_id = $2", [`${reference}-document`, item.id]);
+  }
+  const originals = await db.all("SELECT * FROM loads ORDER BY id");
+  const documents = await db.all("SELECT * FROM files ORDER BY id");
+  const storage = new DriveStorage();
+  const root = "fixture-sync-root";
+  const originalMode = process.env.STORAGE_MODE;
+  const originalRoot = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID;
+  let rootAvailable = false;
+  t.mock.method(require("../lib/storage.ts"), "getStorage", () => storage);
+  t.mock.method(storage, "drive", async () => ({
+    files: {
+      get: async ({ fileId }) => {
+        if (fileId === root) return { data: {
+          mimeType: "application/vnd.google-apps.folder", trashed: !rootAvailable,
+          capabilities: { canListChildren: true },
+        } };
+        if (fileId === "trashed-load") return { data: { mimeType: "application/vnd.google-apps.folder", trashed: true } };
+        if (fileId === "deleted-load") throw Object.assign(new Error("Folder permanently deleted"), { code: 404 });
+        if (fileId === "access-load") throw Object.assign(new Error("Folder permission denied"), { code: 403 });
+        throw new Error(`Unexpected metadata request: ${fileId}`);
+      },
+      list: async ({ q }) => {
+        const driverEntry = { id: "available-driver", name: "Available Driver", createdTime: "2026-09-01T00:00:00Z" };
+        const loadEntry = { id: "keeper-load", name: "Load #KEEPER", createdTime: "2026-09-01T00:00:00Z" };
+        if (q.includes(`'${root}' in parents`)) {
+          return { data: { files: !q.startsWith("name =") || q.includes("name = 'Available Driver'") ? [driverEntry] : [] } };
+        }
+        if (q.includes("'available-driver' in parents")) {
+          return { data: { files: !q.startsWith("name =") || q.includes("name = 'Load #KEEPER'") ? [loadEntry] : [] } };
+        }
+        if (q.includes("'keeper-load' in parents")) return { data: { files: [] } };
+        throw new Error(`Unexpected folder listing: ${q}`);
+      },
+      create: async () => assert.fail("Missing-folder archiving must not create Drive folders"),
+      update: async () => assert.fail("Missing-folder archiving must not rename or move Drive folders"),
+      delete: async () => assert.fail("Missing-folder archiving must not delete Drive documents"),
+    },
+  }));
+  await postgres.pool.query("UPDATE dispatch_meta SET storage_mode = 'drive', storage_root = $1", [root]);
+  process.env.STORAGE_MODE = "drive";
+  process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID = root;
+  try {
+    const blocked = await call("sync", "POST");
+    assert.equal(blocked.status, 200);
+    assert.equal(blocked.data.loadsArchived, 0);
+    assert.ok(blocked.data.errors.some((error) => /storage root is unavailable/.test(error)));
+    assert.deepEqual(await db.all("SELECT * FROM loads ORDER BY id"), originals);
+    rootAvailable = true;
+    const synced = await call("sync", "POST");
+    assert.equal(synced.status, 200);
+    assert.equal(synced.data.loadsArchived, 4);
+    assert.equal(synced.data.errors.length, 1);
+    assert.match(synced.data.errors[0], /permission denied/);
+    const current = await db.all("SELECT * FROM loads ORDER BY id");
+    for (let index = 0; index < originals.length; index++) {
+      assert.equal(Boolean(current[index].archived_at), index < 4);
+      assert.deepEqual(current[index], { ...originals[index], archived_at: current[index].archived_at });
+    }
+    assert.deepEqual(await db.all("SELECT * FROM files ORDER BY id"), documents);
+    assert.deepEqual((await call("loads", "GET")).data.map((row) => row.load_number).sort(), ["ACCESS", "KEEPER"]);
+    assert.equal((await call("drivers", "GET")).data.length, 2);
+    assert.equal((await call("sync", "POST")).data.loadsArchived, 0);
+    assert.deepEqual(await db.all("SELECT * FROM loads ORDER BY id"), current);
+  } finally {
+    await postgres.pool.query("UPDATE dispatch_meta SET storage_mode = $1, storage_root = $2", [postgres.binding.mode, postgres.binding.root]);
+    process.env.STORAGE_MODE = originalMode;
+    if (originalRoot === undefined) delete process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID;
+    else process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID = originalRoot;
+  }
 });
 
 test("folder permission errors and non-directory replacements are not evidence of deletion", async (t) => {

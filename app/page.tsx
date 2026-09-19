@@ -21,10 +21,10 @@ const filterLabelCls = "mb-1 block text-[11px] font-medium uppercase tracking-wi
 const MAX_SYNC_BATCHES_PER_RUN = 250;
 
 function syncSummaryMessage(summary: SyncSummary): string {
-  let message = `${summary.driversScanned} driver(s) scanned; ${summary.driversImported} driver(s), ${summary.loadsImported} load(s), ${summary.filesImported} file(s) imported.`;
-  if (summary.loadsArchived) message += ` ${summary.loadsArchived} load(s) moved to Archived because their folders are missing. Deleted documents were not recovered.`;
-  if (summary.skippedArchived) message += ` ${summary.skippedArchived} archived folder(s) skipped.`;
-  if (summary.errors.length) message += ` ${summary.errors.length} error(s): ${summary.errors.join("; ")}`;
+  let message = summary.errors.length
+    ? "Sync finished with issues. Check storage access and try again."
+    : "Sync complete.";
+  if (summary.loadsArchived) message += ` ${summary.loadsArchived} load${summary.loadsArchived === 1 ? "" : "s"} archived.`;
   return message;
 }
 
@@ -157,8 +157,7 @@ function LoadBoard() {
     syncRequest.current = controller;
     let cursor = startNew ? null : syncCursor;
     if (startNew) setSyncCursor(null);
-    if (cursor) setSyncMsg((previous) => previous || "Resuming saved sync…");
-    else setSyncMsg("Starting sync…");
+    setSyncMsg(cursor ? "Resuming sync…" : "Syncing storage…");
     setActionError("");
     try {
       for (let batch = 1; batch <= MAX_SYNC_BATCHES_PER_RUN; batch++) {
@@ -172,18 +171,19 @@ function LoadBoard() {
         if (!summary || (summary.cursor !== null && (typeof summary.cursor !== "string" || !summary.cursor.trim()))) {
           throw new Error("The server returned an invalid sync cursor. Refresh the application before retrying.");
         }
-        const message = syncSummaryMessage(summary);
         cursor = summary.cursor;
         setSyncCursor(cursor);
-        setSyncMsg(cursor ? `Sync progress (${batch} batch(es) this run): ${message}` : `Sync complete: ${message}`);
+        setSyncMsg(cursor ? "Syncing storage…" : syncSummaryMessage(summary));
         if (cursor === null) return;
       }
       throw new Error("The per-run batch limit was reached. Continue the saved sync to process the remaining folders.");
     } catch (failure: unknown) {
       if (!controller.signal.aborted) {
+        console.error(`[dispatch sync] ${errorMessage(failure)}`);
+        setSyncMsg("");
         setActionError(cursor
-          ? `Sync paused: ${errorMessage(failure)} Choose Resume Sync to continue. Saved runs expire after 24 hours; start a new sync if the run has expired.`
-          : `Sync failed: ${errorMessage(failure)} No continuation was received; retry Sync Storage.`);
+          ? "Sync paused. Resume sync or start a new run."
+          : "Sync failed. Refresh the dashboard and try again.");
       }
     } finally {
       if (!controller.signal.aborted) {
@@ -255,7 +255,7 @@ function LoadBoard() {
       </div>
 
       {syncMsg && (
-        <div role="status" aria-live="polite" aria-busy={syncing} className="mb-5 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-[13px] text-blue-900">
+        <div role="status" aria-live="polite" aria-busy={syncing} className="mb-4 text-[12px] text-slate-500">
           {syncMsg}
         </div>
       )}

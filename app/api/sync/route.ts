@@ -41,7 +41,10 @@ function guessCategory(filename: string): FileCategory {
 }
 
 function addError(summary: SyncSummary, message: string) {
-  if (summary.errors.length < 100) summary.errors.push(message);
+  if (summary.errors.length < 100) {
+    summary.errors.push(message);
+    console.error(`[dispatch sync] ${message}`);
+  }
   else if (summary.errors.length === 100) summary.errors.push("More sync errors occurred. Resolve the reported problems and run Sync storage again.");
 }
 

@@ -3,12 +3,17 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { DriveStorage, loadFolderName, movedReference } = require("../lib/storage.ts");
 
+const rootMetadata = {
+  mimeType: "application/vnd.google-apps.folder", trashed: false, capabilities: { canListChildren: true },
+};
+
 function mockedDrive(t, parent = "original-parent") {
   const updates = [];
   const creates = [];
   const storage = new DriveStorage();
   const files = {
-    get: async () => ({ data: { id: "load-id", name: "Load #100", mimeType: "application/vnd.google-apps.folder", parents: ["original-parent"] } }),
+    get: async (request) => ({ data: request.fileId === "root-id" ? rootMetadata
+      : { id: "load-id", name: "Load #100", mimeType: "application/vnd.google-apps.folder", parents: ["original-parent"] } }),
     list: async () => ({ data: { files: [] } }),
     update: async (request) => { updates.push(request); return { data: {} }; },
     create: async (request) => { creates.push(request); return { data: { id: `created-${creates.length}` } }; },
@@ -296,6 +301,7 @@ test("Drive folder presence requires explicit metadata and recognizes confirmed 
   const { storage, files, updates } = mockedDrive(t);
   for (const trashed of [false, true]) {
     files.get = async (request) => {
+      if (request.fileId === "root-id") return { data: rootMetadata };
       assert.equal(request.fileId, "load-id");
       assert.equal(request.fields, "mimeType, trashed");
       assert.equal(request.supportsAllDrives, true);
@@ -304,22 +310,63 @@ test("Drive folder presence requires explicit metadata and recognizes confirmed 
     assert.equal(await storage.loadFolderPresent("Driver", "load-id"), !trashed);
   }
   for (const metadata of [{}, { mimeType: "application/vnd.google-apps.folder" }, { mimeType: "text/plain", trashed: false }]) {
-    files.get = async () => ({ data: metadata });
+    files.get = async (request) => ({ data: request.fileId === "root-id" ? rootMetadata : metadata });
     await assert.rejects(storage.loadFolderPresent("Driver", "load-id"), /did not confirm/);
   }
   assert.equal(updates.length, 0);
 });
 
-test("Drive not-found, permission, and connection failures never count as deleted folders", async (t) => {
-  const { storage, files, updates } = mockedDrive(t);
-  for (const code of [404, 403, 500]) {
-    files.get = async () => { throw Object.assign(new Error(`Drive failure ${code}`), { code }); };
-    await assert.rejects(storage.loadFolderPresent("Driver", "load-id"),
-      code === 404 ? /not found or is inaccessible/ : new RegExp(`Drive failure ${code}`));
-  }
+test("Drive treats missing load and driver folders as absent when the storage root is readable", async (t) => {
+  const { storage, files, updates, creates } = mockedDrive(t);
+  const reads = [];
+  files.get = async (request) => {
+    reads.push(request.fileId);
+    if (request.fileId === "root-id") return { data: rootMetadata };
+    throw Object.assign(new Error("Load permanently deleted"), { code: 404 });
+  };
+  assert.equal(await storage.loadFolderPresent("Driver", "deleted-load-id"), false);
+  assert.deepEqual(reads, ["root-id", "deleted-load-id"]);
   t.mock.method(storage, "driverFolder", async () => null);
-  files.get = async () => assert.fail("Do not infer load deletions when the driver folder is unavailable");
-  await assert.rejects(storage.loadFolderPresent("Driver", "load-id"), /Drive folder is unavailable/);
+  reads.length = 0;
+  assert.equal(await storage.loadFolderPresent("Driver", "load-id"), false);
+  assert.deepEqual(reads, ["root-id"]);
+  assert.equal(updates.length, 0);
+  assert.equal(creates.length, 0);
+});
+
+test("Drive refuses missing, trashed, unreadable, or unconfirmed roots before inferring folder deletion", async (t) => {
+  const { storage, files } = mockedDrive(t);
+  for (const metadata of [
+    {}, { ...rootMetadata, trashed: true }, { ...rootMetadata, mimeType: "text/plain" },
+    { ...rootMetadata, capabilities: {} }, { ...rootMetadata, capabilities: { canListChildren: false } },
+  ]) {
+    files.get = async (request) => {
+      assert.equal(request.fileId, "root-id");
+      return { data: metadata };
+    };
+    await assert.rejects(storage.loadFolderPresent("Driver", "load-id"), /storage root is unavailable/);
+    await assert.rejects(storage.listDriverFolders(), /storage root is unavailable/);
+  }
+  for (const code of [404, 403, 500]) {
+    files.get = async (request) => {
+      assert.equal(request.fileId, "root-id");
+      throw Object.assign(new Error(`Root request failed ${code}`), { code });
+    };
+    await assert.rejects(storage.loadFolderPresent("Driver", "load-id"), /Root request failed/);
+    await assert.rejects(storage.listDriverFolders(), /Root request failed/);
+  }
+});
+
+test("Drive permission and connection failures remain errors rather than missing folders", async (t) => {
+  const { storage, files, updates } = mockedDrive(t);
+  for (const code of [403, 429, 500, "ETIMEDOUT"]) {
+    files.get = async (request) => {
+      if (request.fileId === "root-id") return { data: rootMetadata };
+      throw Object.assign(new Error(`Drive failure ${code}`), { code });
+    };
+    await assert.rejects(storage.loadFolderPresent("Driver", "load-id"),
+      new RegExp(`Drive failure ${code}`));
+  }
   assert.equal(updates.length, 0);
 });
 

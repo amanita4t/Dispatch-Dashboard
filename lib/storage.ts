@@ -139,11 +139,17 @@ export class LocalStorage implements StorageProvider {
       throw new RequestError("The linked load folder is outside this driver's storage folder; resolve the reference first", 409);
     }
     try {
-      fs.readdirSync(driverDir);
+      fs.readdirSync(getStoragePath());
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) {
-        throw new RequestError("The driver's storage folder is unavailable; restore access before syncing missing loads", 409);
+        throw new RequestError("The document storage root is unavailable; restore access before syncing missing loads", 409);
       }
+      throw error;
+    }
+    try {
+      fs.readdirSync(driverDir);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return false;
       throw error;
     }
     let stat: fs.Stats;
@@ -401,17 +407,27 @@ export class DriveStorage implements StorageProvider {
     return driver || (create ? this.createFolder(drive, sanitizeName(driverName), this.rootFolderId()) : null);
   }
 
+  private async assertRootReadable(): Promise<void> {
+    const response = await (await this.drive()).files.get({
+      fileId: this.rootFolderId(), fields: "mimeType, trashed, capabilities(canListChildren)", supportsAllDrives: true,
+    });
+    if (response.data.mimeType !== "application/vnd.google-apps.folder" || response.data.trashed !== false ||
+        response.data.capabilities?.canListChildren !== true) {
+      throw new RequestError("The Drive storage root is unavailable or cannot be listed; restore access before syncing", 409);
+    }
+  }
+
   async listDriverFolders(): Promise<StorageDriverFolder[]> {
+    await this.assertRootReadable();
     return (await this.listEntries(this.rootFolderId(), true)).map((entry) => ({
       name: entry.filename, folderRef: entry.storageRef,
     }));
   }
 
   async loadFolderPresent(driverName: string, folderRef: string): Promise<boolean> {
+    await this.assertRootReadable();
+    if (!await this.driverFolder(driverName, false)) return false;
     try {
-      if (!await this.driverFolder(driverName, false)) {
-        throw new RequestError("The driver's Drive folder is unavailable; restore access before syncing missing loads", 409);
-      }
       const response = await (await this.drive()).files.get({
         fileId: folderRef, fields: "mimeType, trashed", supportsAllDrives: true,
       });
@@ -420,9 +436,7 @@ export class DriveStorage implements StorageProvider {
       }
       return !response.data.trashed;
     } catch (error) {
-      if (hasErrorCode(error, 404)) {
-        throw new RequestError("The Drive folder was not found or is inaccessible. Check its location and permissions before archiving.", 409);
-      }
+      if (hasErrorCode(error, 404)) return false;
       throw error;
     }
   }

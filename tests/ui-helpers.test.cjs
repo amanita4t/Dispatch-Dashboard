@@ -348,14 +348,14 @@ function button(tree, label) {
   return found;
 }
 
-test("the board awaits cursor batches, prevents duplicate syncs and displays the latest cumulative summary", async (t) => {
+test("the board awaits cursor batches and shows compact status without paths, filenames, or per-folder details", async (t) => {
   const gate = Promise.withResolvers();
   const requests = [];
   const summaries = [
-    syncSummary({ driversScanned: 1, driversImported: 1, errors: ["Folder conflict"] }),
-    syncSummary({ driversScanned: 1, driversImported: 1, errors: ["Folder conflict"] }),
+    syncSummary({ driversScanned: 1, driversImported: 1, errors: ["C:\\private\\Driver\\Load #PRIVATE-123\\ratecon.pdf: Folder conflict"] }),
+    syncSummary({ driversScanned: 1, driversImported: 1, errors: ["C:\\private\\Driver\\Load #PRIVATE-123\\ratecon.pdf: Folder conflict"] }),
     syncSummary({ cursor: null, driversScanned: 2, driversImported: 2, loadsImported: 3, filesImported: 4,
-      loadsArchived: 1, skippedArchived: 2, errors: ["Folder conflict"] }),
+      loadsArchived: 1, skippedArchived: 2, errors: ["C:\\private\\Driver\\Load #PRIVATE-123\\ratecon.pdf: Folder conflict"] }),
   ];
   let page;
   let activeRequests = 0;
@@ -366,7 +366,11 @@ test("the board awaits cursor batches, prevents duplicate syncs and displays the
     assert.equal(activeRequests, 1, "Sync batches must not overlap.");
     assert.ok(options.signal instanceof AbortSignal);
     if (requests.length === 1) await gate.promise;
-    if (requests.length === 2) assert.match(elementText(page.render()), /Sync progress \(1 batch\(es\) this run\)/);
+    if (requests.length === 2) {
+      const progress = elementText(page.render());
+      assert.match(progress, /Syncing storage/);
+      assert.doesNotMatch(progress, /PRIVATE-123|ratecon\.pdf|Folder conflict|batch\(es\)|driver\(s\) scanned/);
+    }
     activeRequests--;
     return Response.json(summaries[requests.length - 1]);
   });
@@ -386,16 +390,16 @@ test("the board awaits cursor batches, prevents duplicate syncs and displays the
     assert.equal(request.headers["Content-Type"], "application/json");
   }
   const completed = elementText(page.render());
-  assert.match(completed, /Sync complete: 2 driver\(s\) scanned; 2 driver\(s\), 3 load\(s\), 4 file\(s\) imported/);
-  assert.match(completed, /1 load\(s\) moved to Archived/);
-  assert.match(completed, /2 archived folder\(s\) skipped/);
-  assert.match(completed, /1 error\(s\): Folder conflict/);
-  assert.equal(completed.split("Folder conflict").length - 1, 1);
+  assert.match(completed, /Sync finished with issues/);
+  assert.match(completed, /1 load archived/);
+  assert.match(completed, /storage access/);
+  assert.doesNotMatch(completed, /PRIVATE-123|ratecon\.pdf|Folder conflict|driver\(s\) scanned|archived folder\(s\)|Sync complete/);
   assert.equal(button(page.render(), "Sync Storage").props.disabled, false);
   assert.equal(page.driverRefreshes(), 1);
 });
 
 test("a transient sync failure preserves the cursor and resumes without starting another job", async (t) => {
+  t.mock.method(console, "error", () => {});
   const requests = [];
   t.mock.method(globalThis, "fetch", async (url, options) => {
     if (url !== "/api/sync") return Response.json([]);
@@ -406,20 +410,21 @@ test("a transient sync failure preserves the cursor and resumes without starting
   });
   const page = clientPage(t, "../app/page.tsx");
   await button(page.render(), "Sync Storage").props.onClick();
-  assert.match(elementText(page.render()), /Sync paused: Connection lost/);
-  assert.match(elementText(page.render()), /Saved runs expire after 24 hours/);
+  assert.match(elementText(page.render()), /Sync paused/);
+  assert.doesNotMatch(elementText(page.render()), /Connection lost/);
   assert.ok(button(page.render(), "Start new sync"));
   await button(page.render(), "Resume Sync").props.onClick();
-  assert.match(elementText(page.render()), /0 driver\(s\) scanned; 2 driver\(s\)/);
+  assert.match(elementText(page.render()), /Sync paused/);
   await button(page.render(), "Resume Sync").props.onClick();
   assert.equal(requests.length, 4);
   assert.deepEqual(JSON.parse(requests[2].body), { cursor: SYNC_CURSOR });
   assert.deepEqual(JSON.parse(requests[3].body), { cursor: SYNC_CURSOR });
-  assert.match(elementText(page.render()), /Sync complete: 0 driver\(s\) scanned; 3 driver\(s\)/);
+  assert.match(elementText(page.render()), /Sync complete\./);
   assert.doesNotMatch(elementText(page.render()), /Connection lost|Start new sync|Resume Sync/);
 });
 
 test("an expired sync can be explicitly replaced by a new empty JSON object", async (t) => {
+  t.mock.method(console, "error", () => {});
   const requests = [];
   t.mock.method(globalThis, "fetch", async (url, options) => {
     if (url !== "/api/sync") return Response.json([]);
@@ -429,7 +434,7 @@ test("an expired sync can be explicitly replaced by a new empty JSON object", as
   });
   const page = clientPage(t, "../app/page.tsx");
   await button(page.render(), "Sync Storage").props.onClick();
-  assert.match(elementText(page.render()), /Sync run expired/);
+  assert.match(elementText(page.render()), /Sync paused/);
   await button(page.render(), "Start new sync").props.onClick();
   assert.deepEqual(JSON.parse(requests[2].body), {});
   assert.equal(requests[2].headers["Content-Type"], "application/json");
@@ -437,6 +442,7 @@ test("an expired sync can be explicitly replaced by a new empty JSON object", as
 });
 
 test("a missing sync cursor fails explicitly instead of entering an endless loop", async (t) => {
+  t.mock.method(console, "error", () => {});
   let requests = 0;
   t.mock.method(globalThis, "fetch", async (url) => {
     if (url !== "/api/sync") return Response.json([]);
@@ -446,11 +452,12 @@ test("a missing sync cursor fails explicitly instead of entering an endless loop
   const page = clientPage(t, "../app/page.tsx");
   await button(page.render(), "Sync Storage").props.onClick();
   assert.equal(requests, 1);
-  assert.match(elementText(page.render()), /Sync failed: The server returned an invalid sync cursor/);
+  assert.match(elementText(page.render()), /Sync failed/);
   assert.doesNotMatch(elementText(page.render()), /Sync complete/);
 });
 
 test("unchanged counters and a stable cursor still continue, but a per-run batch ceiling permits safe resume", async (t) => {
+  t.mock.method(console, "error", () => {});
   let requests = 0;
   t.mock.method(globalThis, "fetch", async (url) => {
     if (url !== "/api/sync") return Response.json([]);
@@ -460,8 +467,23 @@ test("unchanged counters and a stable cursor still continue, but a per-run batch
   const page = clientPage(t, "../app/page.tsx");
   await button(page.render(), "Sync Storage").props.onClick();
   assert.equal(requests, 250);
-  assert.match(elementText(page.render()), /Sync paused: The per-run batch limit was reached/);
+  assert.match(elementText(page.render()), /Sync paused/);
   assert.ok(button(page.render(), "Resume Sync"));
+});
+
+test("failed sync hides backend file details while keeping an explicit retry message and diagnostic log", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  t.mock.method(globalThis, "fetch", async (url) => url === "/api/sync"
+    ? Response.json({ error: "Cannot read C:\\private\\Load #PRIVATE-456\\invoice.pdf" }, { status: 500 })
+    : Response.json([]));
+  const page = clientPage(t, "../app/page.tsx");
+  await button(page.render(), "Sync Storage").props.onClick();
+  const text = elementText(page.render());
+  assert.match(text, /Sync failed/);
+  assert.match(text, /try again/i);
+  assert.doesNotMatch(text, /PRIVATE-456|invoice\.pdf|C:\\private|Sync complete|Syncing storage/);
+  assert.equal(logged.mock.callCount(), 1);
+  assert.match(logged.mock.calls[0].arguments.join(" "), /PRIVATE-456/);
 });
 
 test("leaving the board aborts its current sync request and never starts another batch", async (t) => {
