@@ -112,6 +112,8 @@ are not deployment inputs. The deployment exclusions keep `data\`, `storage\`,
 `backups\`, `tests\`, and operator scripts out of Vercel uploads and function
 traces. Only `scripts\check-build-traces.cjs` is uploaded for the build step; it
 also removes private references missed by Next 14's Windows glob matching.
+Keep Next's exclusions scoped to API routes: a global `*` key also filters shared
+dependencies and can accidentally remove packages such as `gcp-metadata`.
 This guard supports Vercel serverless builds, not standalone output.
 Run migration tools from a trusted operator checkout, not from a deployed function bundle.
 Keep credentials private and review deployment inputs before publishing.

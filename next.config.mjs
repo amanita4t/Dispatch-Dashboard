@@ -3,7 +3,8 @@ const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: ["pg", "googleapis"],
     outputFileTracingExcludes: {
-      "*": ["./data/**/*", "./storage/**/*", "./backups/**/*", "./tests/**/*", "./scripts/**/*", "./migrations/**/*", "./.env*"],
+      // A "*" route key also applies substring exclusions to shared dependencies in Next 14.
+      "/api/**/*": ["./data/**/*", "./storage/**/*", "./backups/**/*", "./tests/**/*", "./scripts/**/*", "./migrations/**/*", "./.env*"],
     },
   },
 };

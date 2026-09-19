@@ -1,8 +1,31 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const { test } = require("node:test");
+const picomatch = require("next/dist/compiled/picomatch");
 const { checkBuildTraces } = require("../scripts/check-build-traces.cjs");
+
+test("Next.js privacy exclusions cover API routes without pruning shared Google dependencies", async () => {
+  const { default: config } = await import(pathToFileURL(path.resolve(__dirname, "..", "next.config.mjs")).href);
+  const exclusions = config.experimental.outputFileTracingExcludes;
+  const sharedExclusions = Object.entries(exclusions)
+    .filter(([route]) => picomatch(route)("next-server"))
+    .flatMap(([, patterns]) => patterns);
+  const sharedIgnore = picomatch(sharedExclusions, { contains: true, dot: true });
+  for (const dependency of [
+    "node_modules/gcp-metadata/build/src/index.js",
+    "node_modules/google-auth-library/node_modules/gcp-metadata/build/src/index.js",
+    "node_modules/googleapis/build/src/apis/analyticsdata/v1beta.js",
+    "node_modules/googleapis/build/src/apis/storage/v1.js",
+  ]) {
+    assert.equal(sharedIgnore(dependency), false, `Next's shared trace would omit ${dependency}`);
+  }
+  for (const route of ["/api/loads", "/api/loads/1/files", "/api/drivers", "/api/files/1", "/api/sync", "/api/status"]) {
+    assert.ok(Object.keys(exclusions).some((pattern) => picomatch(pattern, { contains: true, dot: true })(route)),
+      `Privacy exclusions must still cover ${route}`);
+  }
+});
 
 function fixture(t) {
   const data = path.resolve(__dirname, "..", "data");
@@ -28,6 +51,11 @@ test("deployment traces exclude private data without changing source files or ru
   privateFiles.push(source, path.join(root, ".env"), path.join(root, ".env.local"));
   const dependencies = [
     path.join(root, "node_modules", "googleapis", "build", "src", "apis", "storage", "v1.js"),
+    path.join(root, "node_modules", "googleapis", "build", "src", "apis", "analyticsdata", "v1beta.js"),
+    path.join(root, "node_modules", "google-auth-library", "node_modules", "gcp-metadata", "build", "src", "index.js"),
+    path.join(root, "node_modules", "gcp-metadata", "package.json"),
+    path.join(root, "node_modules", "json-bigint", "index.js"),
+    path.join(root, "node_modules", "bignumber.js", "bignumber.js"),
     path.join(root, ".next", "server", "chunks", "123.js"),
   ].map((file) => path.relative(directory, file));
   const manifest = path.join(directory, "route.js.nft.json");
