@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@vercel/functions": "^3.9.8",
+    "gcp-metadata": "^9.0.4",
     "googleapis": "^176.0.0",
     "next": "14.2.35",
     "pg": "^8.23.0",
